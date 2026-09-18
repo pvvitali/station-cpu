@@ -1,6 +1,12 @@
 #![no_std]
 #![no_main]
 
+use embassy_stm32::Config;
+use embassy_stm32::rcc::{
+    AHBPrescaler, APBPrescaler, Hse, HseMode, Pll, PllPDiv, PllSource, Sysclk,
+};
+use embassy_stm32::time::Hertz;
+
 use defmt::{error, info, warn};
 use defmt_rtt as _;
 use panic_probe as _;
@@ -14,6 +20,10 @@ use embassy_stm32::mode::Async;
 use embassy_time::{Duration, Timer, with_timeout}; // Добавляем импорт модуля прерываний
 //
 use core::sync::atomic::{AtomicBool, Ordering};
+//
+mod display;
+use core::fmt::Write;
+use display::{DisplayCmd, Telemetry};
 
 // false = Внешнее питание (12В), true = Батарея
 static POWER_SOURCE: AtomicBool = AtomicBool::new(false);
@@ -152,17 +162,46 @@ async fn led_manager(mut led_ext: Output<'static>, mut led_batt: Output<'static>
     }
 }
 
+//##########################################################################################
 // --- Главный процесс ---
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    // 1. Создаем конфигурацию по умолчанию
-    let mut config = embassy_stm32::Config::default();
+    // 1. Создаем пустую конфигурацию
+    let mut config = Config::default();
 
-    // 2. Принудительно разрешаем работу SWD-отладчика в спящем режиме
+    // 2. Включаем внешний кварц на 8 МГц (HSE)
+    config.rcc.hse = Some(Hse {
+        freq: Hertz(8_000_000),
+        mode: HseMode::Oscillator,
+    });
+
+    // 3. Настраиваем умножитель частоты (PLL)
+    // Формула: Выходная частота = (HSE / prediv) * mul / divp
+    // Вход VCO должен быть в пределах 1-2 МГц, поэтому делим 8 МГц на 4.
+    config.rcc.pll_src = PllSource::HSE;
+    config.rcc.pll = Some(Pll {
+        prediv: 4.into(),          // 8 MHz / 4 = 2 MHz (вход PLL)
+        mul: 96.into(),            // 2 MHz * 96 = 192 MHz (внутренняя частота PLL)
+        divp: Some(PllPDiv::DIV4), // 192 MHz / 4 = 48 MHz (наша системная частота!)
+        divq: None,
+        divr: None,
+    });
+
+    // 4. Указываем, что главным источником тактирования (SYSCLK) будет PLL
+    config.rcc.sys = Sysclk::PLL1_P;
+
+    // 5. Настраиваем делители для внутренних шин (чтобы периферия работала корректно)
+    config.rcc.ahb_pre = AHBPrescaler::DIV1; // Шина AHB = 48 MHz (Процессор, DMA, GPIO)
+    config.rcc.apb1_pre = APBPrescaler::DIV2; // Шина APB1 = 24 MHz (UART, Таймеры)
+    config.rcc.apb2_pre = APBPrescaler::DIV1; // Шина APB2 = 48 MHz (SPI1/4, АЦП)
+
+    // Принудительно разрешаем работу SWD-отладчика в спящем режиме
     config.enable_debug_during_sleep = true;
 
-    // 3. Инициализируем контроллер с этой настройкой
+    // Применяем настройки железа
     let p = embassy_stm32::init(config);
+
+    //-----------------------------------------------------------
 
     // 1. Настройка светодиода (PB2)
     let led_pin = Output::new(p.PB2, Level::Low, Speed::Low);
@@ -183,7 +222,28 @@ async fn main(spawner: Spawner) {
 
     info!("Станция катодной защиты: Система питания инициализирована!");
 
-    // 4. Запуск независимых задач
+    // =========================================================
+    // 2. ИНИЦИАЛИЗАЦИЯ ДИСПЛЕЯ
+    // =========================================================
+    let dc = Output::new(p.PB14, Level::Low, Speed::VeryHigh);
+    let rst = Output::new(p.PB10, Level::High, Speed::VeryHigh);
+    let cs = Output::new(p.PB12, Level::High, Speed::VeryHigh); // Программный CS
+
+    let mut spi_config = embassy_stm32::spi::Config::default();
+    spi_config.frequency = embassy_stm32::time::Hertz(4_000_000);
+
+    let spi2 = embassy_stm32::spi::Spi::new_blocking_txonly(
+        p.SPI2, p.PB13, // SCK
+        p.PB15, // MOSI
+        spi_config,
+    );
+
+    // Запускаем задачу
+    spawner.spawn(display::display_task(spi2, dc, cs, rst).unwrap());
+
+    // =========================================================
+    // Запуск независимых задач
+    // =========================================================
     // Макрос #[task] возвращает Result<SpawnToken, SpawnError>,
     // поэтому распаковываем токен (unwrap) перед передачей в spawner.
     spawner.spawn(blink_led(led_pin).unwrap());
@@ -197,7 +257,54 @@ async fn main(spawner: Spawner) {
     Timer::after_millis(500).await;
     reset_bth_pin.set_low();
 
+    // =========================================================
+    // 3. ТЕСТОВАЯ ОТПРАВКА ДАННЫХ
+    // =========================================================
+
+    //Timer::after_secs(1).await;
+    //Timer::after_secs(1).await;
+
+    // Отправляем начальный лог
+    let mut msg = heapless::String::<32>::new();
+    core::write!(&mut msg, "Booting sensors...").unwrap();
+    display::DISPLAY_CHANNEL.send(DisplayCmd::Log(msg)).await;
+
+    Timer::after_secs(2).await;
+
+    // Отправляем тестовый пакет телеметрии
+    let test_data = Telemetry {
+        mod1_v: 12.4,
+        mod1_i: 1.2,
+        mod1_pot: -0.850,
+
+        mod2_v: 0.0,
+        mod2_i: 0.0,
+        mod2_pot: 0.0,
+
+        is_door_open: false,
+        gsm_signal_percent: 85,
+    };
+
+    display::DISPLAY_CHANNEL
+        .send(DisplayCmd::Update(test_data.clone()))
+        .await;
+
+    // СТРЕСС-ТЕСТ SPI
+    let mut counter = 0.0;
     loop {
-        Timer::after_secs(1).await;
+        let mut stress_data = test_data.clone();
+        stress_data.mod1_v = counter; // Меняем цифры на экране, чтобы заставить SPI работать
+
+        display::DISPLAY_CHANNEL
+            .send(DisplayCmd::Update(stress_data))
+            .await;
+
+        counter += 0.1;
+        if counter > 100.0 {
+            counter = 0.0;
+        }
+
+        // Обновляем дисплей 50 раз в секунду (как в играх)
+        Timer::after_millis(20).await;
     }
 }

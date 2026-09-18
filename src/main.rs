@@ -266,23 +266,25 @@ async fn main(spawner: Spawner) {
 
     // Отправляем начальный лог
     let mut msg = heapless::String::<32>::new();
-    core::write!(&mut msg, "Booting sensors...").unwrap();
+    core::write!(&mut msg, "Booting system...").unwrap();
     display::DISPLAY_CHANNEL.send(DisplayCmd::Log(msg)).await;
 
     Timer::after_secs(2).await;
 
     // Отправляем тестовый пакет телеметрии
+    // Формируем диагностическое сообщение
+    let mut diag = heapless::String::<32>::new();
+    core::write!(&mut diag, "SYSTEM OK").unwrap();
+
     let test_data = Telemetry {
         mod1_v: 12.4,
         mod1_i: 1.2,
-        mod1_pot: -0.850,
-
-        mod2_v: 0.0,
-        mod2_i: 0.0,
-        mod2_pot: 0.0,
-
+        mod2_v: 11.8, // Добавили данные для красоты
+        mod2_i: 0.5,  // Добавили данные для красоты
+        p: -0.850,    // Изменили имя переменной
         is_door_open: false,
-        gsm_signal_percent: 85,
+        gsm_signal_percent: 65,
+        diag_msg: diag, // Передали сообщение
     };
 
     display::DISPLAY_CHANNEL

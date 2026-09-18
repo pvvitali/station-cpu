@@ -16,29 +16,26 @@ use heapless::String;
 
 use core::fmt::Write;
 use embedded_graphics::{
-    mono_font::{MonoTextStyleBuilder, ascii::FONT_5X8}, // <-- Изменили шрифт
+    mono_font::{MonoTextStyleBuilder, ascii::FONT_6X10}, // Увеличили шрифт
     pixelcolor::BinaryColor,
     prelude::*,
-    text::Text,
+    // Добавляем инструменты для рисования линий и прямоугольников:
+    primitives::{Line, PrimitiveStyle, Rectangle},
+    text::{Baseline, Text, TextStyleBuilder},
 };
 
 // --- СТРУКТУРЫ ТЕЛЕМЕТРИИ (Восстановлено из main.rs) ---
 
 #[derive(Clone, Default)]
 pub struct Telemetry {
-    // Модуль 1
     pub mod1_v: f32,
     pub mod1_i: f32,
-    pub mod1_pot: f32,
-
-    // Модуль 2
     pub mod2_v: f32,
     pub mod2_i: f32,
-    pub mod2_pot: f32,
-
-    // Статусы
+    pub p: f32, // Оставили только один потенциал
     pub is_door_open: bool,
     pub gsm_signal_percent: u8,
+    pub diag_msg: heapless::String<32>, // Новое поле для сообщения внизу экрана
 }
 
 pub enum DisplayCmd {
@@ -70,11 +67,15 @@ pub async fn display_task(
     display.clear();
     display.flush().unwrap();
 
-    // Используем новый шрифт 5x8
+    // 1. Стиль самих букв (используем новый шрифт 6x10)
     let text_style = MonoTextStyleBuilder::new()
-        .font(&FONT_5X8)
+        .font(&FONT_6X10) // Изменили с FONT_5X8 на FONT_6X10
         .text_color(BinaryColor::On)
         .build();
+
+    // 2. Стиль макета (Прибиваем координаты строго к ВЕРХНЕМУ краю)
+    // Именно эту переменную потерял компилятор
+    let text_layout = TextStyleBuilder::new().baseline(Baseline::Top).build();
 
     loop {
         let cmd = DISPLAY_CHANNEL.receive().await;
@@ -88,23 +89,147 @@ pub async fn display_task(
                     .unwrap();
             }
             DisplayCmd::Update(data) => {
-                let mut buf: heapless::String<256> = heapless::String::new();
+                let mut buf: heapless::String<64> = heapless::String::new();
 
-                // Формируем текст
-                core::writeln!(&mut buf, "M1: {:.1}V {:.1}A", data.mod1_v, data.mod1_i).unwrap();
-                core::writeln!(&mut buf, "Pot1: {:.3}V", data.mod1_pot).unwrap();
+                // Стиль для рисования линий и пустых рамок
+                let stroke_style = PrimitiveStyle::with_stroke(BinaryColor::On, 1);
+                // Стиль для заливки (сплошные прямоугольники)
+                let fill_style = PrimitiveStyle::with_fill(BinaryColor::On);
 
-                core::writeln!(&mut buf, "M2: {:.1}V {:.1}A", data.mod2_v, data.mod2_i).unwrap();
-                core::writeln!(&mut buf, "Pot2: {:.3}V", data.mod2_pot).unwrap();
+                // --- ЛЕВАЯ КОЛОНКА (ДАТЧИКИ) ---
 
-                // Чуть-чуть сократили пробелы, чтобы выглядело аккуратнее
-                let door = if data.is_door_open { "OPEN" } else { "CLS" };
-                core::write!(&mut buf, "GSM:{}% Door:{}", data.gsm_signal_percent, door).unwrap();
-
-                // Рисуем с Y=8
-                Text::new(buf.as_str(), Point::new(0, 8), text_style)
+                // Модуль 1
+                buf.clear();
+                core::write!(&mut buf, "U: {:.1}V", data.mod1_v).unwrap();
+                Text::with_text_style(buf.as_str(), Point::new(0, 0), text_style, text_layout)
                     .draw(&mut display)
                     .unwrap();
+                buf.clear();
+                core::write!(&mut buf, "I: {:.1}A", data.mod1_i).unwrap();
+                Text::with_text_style(buf.as_str(), Point::new(0, 10), text_style, text_layout)
+                    .draw(&mut display)
+                    .unwrap();
+
+                // Разделитель 1
+                Line::new(Point::new(0, 20), Point::new(65, 20))
+                    .into_styled(stroke_style)
+                    .draw(&mut display)
+                    .unwrap();
+
+                // Модуль 2
+                buf.clear();
+                core::write!(&mut buf, "U: {:.1}V", data.mod2_v).unwrap();
+                Text::with_text_style(buf.as_str(), Point::new(0, 22), text_style, text_layout)
+                    .draw(&mut display)
+                    .unwrap();
+                buf.clear();
+                core::write!(&mut buf, "I: {:.1}A", data.mod2_i).unwrap();
+                Text::with_text_style(buf.as_str(), Point::new(0, 32), text_style, text_layout)
+                    .draw(&mut display)
+                    .unwrap();
+
+                // Разделитель 2
+                Line::new(Point::new(0, 42), Point::new(65, 42))
+                    .into_styled(stroke_style)
+                    .draw(&mut display)
+                    .unwrap();
+
+                // Потенциал
+                buf.clear();
+                core::write!(&mut buf, "P: {:.3}V", data.p).unwrap();
+                Text::with_text_style(buf.as_str(), Point::new(0, 44), text_style, text_layout)
+                    .draw(&mut display)
+                    .unwrap();
+
+                // --- ПРАВАЯ КОЛОНКА (ИКОНКИ) ---
+
+                // 1. Иконка Антенны (в виде классических столбиков связи)
+                let bars = match data.gsm_signal_percent {
+                    0..=20 => 1,
+                    21..=50 => 2,
+                    51..=80 => 3,
+                    _ => 4,
+                };
+                for i in 0..4 {
+                    let h = (i + 1) * 2; // Высота столбиков: 2, 4, 6, 8 пикселей
+                    let x_pos = 75 + i * 4;
+                    let y_pos = 10 - h;
+                    if i < bars {
+                        // Закрашенный столбик (есть сигнал)
+                        Rectangle::new(Point::new(x_pos, y_pos), Size::new(2, h as u32))
+                            .into_styled(fill_style)
+                            .draw(&mut display)
+                            .unwrap();
+                    } else {
+                        // Пустой контур столбика (нет сигнала)
+                        Rectangle::new(Point::new(x_pos, y_pos), Size::new(2, h as u32))
+                            .into_styled(stroke_style)
+                            .draw(&mut display)
+                            .unwrap();
+                    }
+                }
+                // Текст уровня сигнала
+                buf.clear();
+                core::write!(&mut buf, "{}%", data.gsm_signal_percent).unwrap();
+                Text::with_text_style(buf.as_str(), Point::new(95, 0), text_style, text_layout)
+                    .draw(&mut display)
+                    .unwrap();
+
+                // 2. Иконка Двери
+                if data.is_door_open {
+                    // Иконка открытой двери (смещенный контур)
+                    Rectangle::new(Point::new(75, 22), Size::new(8, 12))
+                        .into_styled(stroke_style)
+                        .draw(&mut display)
+                        .unwrap();
+                    Line::new(Point::new(75, 22), Point::new(69, 19))
+                        .into_styled(stroke_style)
+                        .draw(&mut display)
+                        .unwrap();
+                    Line::new(Point::new(75, 34), Point::new(69, 36))
+                        .into_styled(stroke_style)
+                        .draw(&mut display)
+                        .unwrap();
+                    Line::new(Point::new(69, 19), Point::new(69, 36))
+                        .into_styled(stroke_style)
+                        .draw(&mut display)
+                        .unwrap();
+                    Text::with_text_style("OPEN", Point::new(90, 24), text_style, text_layout)
+                        .draw(&mut display)
+                        .unwrap();
+                } else {
+                    // Иконка закрытой двери (сплошной контур с ручкой)
+                    Rectangle::new(Point::new(75, 22), Size::new(8, 12))
+                        .into_styled(stroke_style)
+                        .draw(&mut display)
+                        .unwrap();
+                    // Дверная ручка
+                    Rectangle::new(Point::new(80, 27), Size::new(2, 2))
+                        .into_styled(fill_style)
+                        .draw(&mut display)
+                        .unwrap();
+                    Text::with_text_style("LOCKED", Point::new(90, 24), text_style, text_layout)
+                        .draw(&mut display)
+                        .unwrap();
+                }
+
+                // --- НИЖНЯЯ ПАНЕЛЬ (ДИАГНОСТИКА) ---
+
+                // Отделяем низ линией через весь экран
+                Line::new(Point::new(0, 53), Point::new(128, 53))
+                    .into_styled(stroke_style)
+                    .draw(&mut display)
+                    .unwrap();
+
+                // Выводим диагностическое сообщение
+                Text::with_text_style(
+                    data.diag_msg.as_str(),
+                    Point::new(0, 54),
+                    text_style,
+                    text_layout,
+                )
+                .draw(&mut display)
+                .unwrap();
             }
         }
         display.flush().unwrap();

@@ -293,9 +293,12 @@ async fn main(spawner: Spawner) {
 
     // СТРЕСС-ТЕСТ SPI
     let mut counter = 0.0;
+    let mut is_open: bool = false;
     loop {
         let mut stress_data = test_data.clone();
         stress_data.mod1_v = counter; // Меняем цифры на экране, чтобы заставить SPI работать
+        stress_data.is_door_open = is_open;
+        stress_data.gsm_signal_percent = counter as u8;
 
         display::DISPLAY_CHANNEL
             .send(DisplayCmd::Update(stress_data))
@@ -305,6 +308,7 @@ async fn main(spawner: Spawner) {
         if counter > 100.0 {
             counter = 0.0;
         }
+        is_open = counter < 50.0;
 
         // Обновляем дисплей 50 раз в секунду (как в играх)
         Timer::after_millis(20).await;

@@ -986,6 +986,7 @@ dependencies = [
  "embassy-time",
  "embedded-graphics",
  "heapless",
+ "micromath",
  "panic-probe",
  "ssd1309",
 ]

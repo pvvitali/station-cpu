@@ -136,7 +136,7 @@ pub async fn display_task(
 
                 // Потенциал
                 buf.clear();
-                core::write!(&mut buf, "P= {:.3}V", data.p).unwrap();
+                core::write!(&mut buf, "P= {:.2}V", data.p).unwrap();
                 Text::with_text_style(buf.as_str(), Point::new(0, 44), text_style, text_layout)
                     .draw(&mut display)
                     .unwrap();

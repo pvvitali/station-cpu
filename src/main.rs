@@ -14,7 +14,7 @@ use panic_probe as _;
 use embassy_executor::Spawner;
 use embassy_stm32::bind_interrupts;
 use embassy_stm32::exti::{self, ExtiInput};
-use embassy_stm32::gpio::{Level, Output, Pull, Speed};
+use embassy_stm32::gpio::{Input, Level, Output, Pull, Speed};
 use embassy_stm32::interrupt;
 use embassy_stm32::mode::Async;
 use embassy_time::{Duration, Timer, with_timeout}; // Добавляем импорт модуля прерываний
@@ -23,7 +23,10 @@ use core::sync::atomic::{AtomicBool, Ordering};
 //
 mod display;
 use core::fmt::Write;
-use display::{DisplayCmd, Telemetry};
+use display::DisplayCmd;
+
+mod adc;
+use embassy_stm32::adc::{Adc, AdcChannel}; // Обязательно для работы метода .degrade_adc()
 
 // false = Внешнее питание (12В), true = Батарея
 static POWER_SOURCE: AtomicBool = AtomicBool::new(false);
@@ -208,7 +211,7 @@ async fn main(spawner: Spawner) {
 
     // 2. OTG (PC2) - Управление повышающим преобразователем.
     // Внешняя подтяжка к GND 10 кОм уже есть на плате.
-    let _otg_pin = Output::new(p.PC2, Level::Low, Speed::Low);
+    let _otg_pin = Output::new(p.PC2, Level::High, Speed::Low);
 
     // 3. PG (PC0) и STAT (PC1).
     // Внешние подтяжки 100 кОм к 3.3В, поэтому внутри МК используем Pull::None.
@@ -271,46 +274,28 @@ async fn main(spawner: Spawner) {
 
     Timer::after_secs(2).await;
 
-    // Отправляем тестовый пакет телеметрии
-    // Формируем диагностическое сообщение
-    let mut diag = heapless::String::<32>::new();
-    core::write!(&mut diag, "SYSTEM OK").unwrap();
+    // === ИНИЦИАЛИЗАЦИЯ ДАТЧИКОВ ===
+    // Создаем драйверы прямо в main. Здесь компилятор автоматически разрешит все типы Peri!
+    let adc_inst = Adc::new(p.ADC1);
+    let door = Input::new(p.PA0, Pull::None);
 
-    let test_data = Telemetry {
-        mod1_v: 12.4,
-        mod1_i: 1.2,
-        mod2_v: 11.8, // Добавили данные для красоты
-        mod2_i: 0.5,  // Добавили данные для красоты
-        p: -0.850,    // Изменили имя переменной
-        is_door_open: false,
-        gsm_signal_percent: 65,
-        diag_msg: diag, // Передали сообщение
-    };
+    // Запускаем задачу
+    spawner.spawn(
+        adc::sensors_task(
+            adc_inst,
+            p.PA4.degrade_adc(),
+            p.PA5.degrade_adc(),
+            p.PA6.degrade_adc(),
+            p.PA7.degrade_adc(),
+            p.PC4.degrade_adc(),
+            p.PC5.degrade_adc(),
+            p.PB0.degrade_adc(),
+            p.PB1.degrade_adc(),
+            door,
+        )
+        .unwrap(),
+    );
 
-    display::DISPLAY_CHANNEL
-        .send(DisplayCmd::Update(test_data.clone()))
-        .await;
-
-    // СТРЕСС-ТЕСТ SPI
-    let mut counter = 0.0;
-    let mut is_open: bool = false;
-    loop {
-        let mut stress_data = test_data.clone();
-        stress_data.mod1_v = counter; // Меняем цифры на экране, чтобы заставить SPI работать
-        stress_data.is_door_open = is_open;
-        stress_data.gsm_signal_percent = counter as u8;
-
-        display::DISPLAY_CHANNEL
-            .send(DisplayCmd::Update(stress_data))
-            .await;
-
-        counter += 0.1;
-        if counter > 100.0 {
-            counter = 0.0;
-        }
-        is_open = counter < 50.0;
-
-        // Обновляем дисплей 50 раз в секунду (как в играх)
-        Timer::after_millis(20).await;
-    }
+    // === ФИНАЛ MAIN ===
+    core::future::pending::<()>().await;
 }

@@ -33,6 +33,10 @@ use embassy_stm32::adc::{Adc, AdcChannel}; // Обязательно для ра
 mod encoder;
 //
 use embassy_stm32::timer::qei::{Config as QeiConfig, Qei};
+//PWM
+use embassy_stm32::gpio::OutputType;
+//use embassy_stm32::time::Hertz;
+use embassy_stm32::timer::simple_pwm::{PwmPin, SimplePwm};
 
 // false = Внешнее питание (12В), true = Батарея
 static POWER_SOURCE: AtomicBool = AtomicBool::new(false);
@@ -250,14 +254,48 @@ async fn main(spawner: Spawner) {
     // Запускаем задачу
     spawner.spawn(display::display_task(spi2, dc, cs, rst).unwrap());
 
+    //----------------------PWM-----------------------------
+    // Инициализация ШИМ на TIM4 (10 кГц)
+    // 1. Оборачиваем пины (без суффиксов каналов, просто .new)
+    let pin_u1 = PwmPin::new(p.PB6, OutputType::PushPull);
+    let pin_i1 = PwmPin::new(p.PB7, OutputType::PushPull);
+    let pin_u2 = PwmPin::new(p.PB8, OutputType::PushPull);
+    let pin_i2 = PwmPin::new(p.PB9, OutputType::PushPull);
+
+    // 2. Создаем ШИМ
+    let mut pwm = SimplePwm::new(
+        p.TIM4,
+        Some(pin_u1),
+        Some(pin_i1),
+        Some(pin_u2),
+        Some(pin_i2),
+        Hertz::khz(10),
+        Default::default(),
+    );
+
+    // Обращаемся к каналам на лету (borrow сразу освобождается)
+    pwm.ch1().enable();
+    pwm.ch2().enable();
+    pwm.ch3().enable();
+    pwm.ch4().enable();
+
+    pwm.ch1().set_duty_cycle(0);
+    pwm.ch2().set_duty_cycle(0);
+    pwm.ch3().set_duty_cycle(0);
+    pwm.ch4().set_duty_cycle(0);
+
+    // Получаем потолок из любого канала
+    let max_duty = pwm.ch1().max_duty_cycle();
+
+    //----------------------------------------------------------------------------------
+
     // Энкодер (аппаратный таймер TIM3)
     // Передаем QeiConfig::default() четвертым параметром!
     let qei = Qei::new(p.TIM3, p.PB4, p.PB5, QeiConfig::default());
     //
     let enc_btn = Input::new(p.PB3, Pull::None);
     //
-    // Вызываем с указанием модуля
-    spawner.spawn(encoder::encoder_task(qei, enc_btn).unwrap());
+    spawner.spawn(encoder::encoder_task(qei, enc_btn, pwm, max_duty).unwrap());
 
     // =========================================================
     // Запуск независимых задач

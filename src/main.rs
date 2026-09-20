@@ -22,11 +22,17 @@ use embassy_time::{Duration, Timer, with_timeout}; // Добавляем имп�
 use core::sync::atomic::{AtomicBool, Ordering};
 //
 mod display;
+//
 use core::fmt::Write;
 use display::DisplayCmd;
 
 mod adc;
+//
 use embassy_stm32::adc::{Adc, AdcChannel}; // Обязательно для работы метода .degrade_adc()
+
+mod encoder;
+//
+use embassy_stm32::timer::qei::{Config as QeiConfig, Qei};
 
 // false = Внешнее питание (12В), true = Батарея
 static POWER_SOURCE: AtomicBool = AtomicBool::new(false);
@@ -243,6 +249,15 @@ async fn main(spawner: Spawner) {
 
     // Запускаем задачу
     spawner.spawn(display::display_task(spi2, dc, cs, rst).unwrap());
+
+    // Энкодер (аппаратный таймер TIM3)
+    // Передаем QeiConfig::default() четвертым параметром!
+    let qei = Qei::new(p.TIM3, p.PB4, p.PB5, QeiConfig::default());
+    //
+    let enc_btn = Input::new(p.PB3, Pull::None);
+    //
+    // Вызываем с указанием модуля
+    spawner.spawn(encoder::encoder_task(qei, enc_btn).unwrap());
 
     // =========================================================
     // Запуск независимых задач

@@ -123,7 +123,7 @@ pub async fn display_task(
                     .draw(&mut display)
                     .unwrap();
                 buf.clear();
-                core::write!(&mut buf, "I= {:.1}A", data.mod2_i).unwrap();
+                core::write!(&mut buf, "I= {:.2}A", data.mod2_i).unwrap();
                 Text::with_text_style(buf.as_str(), Point::new(0, 32), text_style, text_layout)
                     .draw(&mut display)
                     .unwrap();

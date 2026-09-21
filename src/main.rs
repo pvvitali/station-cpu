@@ -43,6 +43,14 @@ static POWER_SOURCE: AtomicBool = AtomicBool::new(false);
 // Флаг ошибки заряда
 static BATT_ERROR: AtomicBool = AtomicBool::new(false);
 
+use core::sync::atomic::AtomicI32;
+//use core::sync::atomic::Ordering;
+// Глобальная переменная для напряжения U1 (в милливольтах)
+pub static U1_ACTUAL_MV: AtomicI32 = AtomicI32::new(0);
+
+//bluetooth
+mod bluetooth;
+
 // Явная привязка аппаратных линий прерываний к драйверу EXTI.
 // Это требование новых версий для безопасной обработки IRQ под капотом.
 bind_interrupts!(struct Irqs {
@@ -233,6 +241,9 @@ async fn main(spawner: Spawner) {
     let led_ext_pin = Output::new(p.PA15, Level::Low, Speed::Low);
     let led_batt_pin = Output::new(p.PD2, Level::Low, Speed::Low);
 
+    // Init pin rele
+    let _rele = Output::new(p.PC13, Level::Low, Speed::Low);
+
     info!("Станция катодной защиты: Система питания инициализирована!");
 
     // =========================================================
@@ -317,9 +328,6 @@ async fn main(spawner: Spawner) {
     // 3. ТЕСТОВАЯ ОТПРАВКА ДАННЫХ
     // =========================================================
 
-    //Timer::after_secs(1).await;
-    //Timer::after_secs(1).await;
-
     // Отправляем начальный лог
     let mut msg = heapless::String::<32>::new();
     core::write!(&mut msg, "Booting system...").unwrap();
@@ -349,6 +357,11 @@ async fn main(spawner: Spawner) {
         .unwrap(),
     );
 
-    // === ФИНАЛ MAIN ===
-    core::future::pending::<()>().await;
+    // Запускаем задачу Bluetooth
+    // Запускаем задачу Bluetooth (сначала USART, потом RX, потом TX)
+    spawner.spawn(bluetooth::bluetooth_task(p.USART2, p.PA3, p.PA2).unwrap());
+
+    loop {
+        Timer::after_millis(5000).await;
+    }
 }

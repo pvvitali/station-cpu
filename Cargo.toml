@@ -31,3 +31,4 @@ ssd1309 = "0.4.0"
 heapless = "0.9.3"
 
 micromath = "2.1"
+embedded-io-async = { version = "0.7.0", default-features = false }

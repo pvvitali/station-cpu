@@ -6,6 +6,8 @@ use embassy_time::Timer;
 
 use micromath::F32Ext; // Обязательно для вычисления логарифма (ln)
 
+// use core::sync::atomic::Ordering;
+
 const TEMP_T1_OFFSET: f32 = -2.0;
 
 fn raw_to_volts(raw: u16) -> f32 {
@@ -93,7 +95,7 @@ pub async fn sensors_task(
         let raw_m2_i = adc.blocking_read(&mut pin_m2_i, sample_time);
         let raw_bat = adc.blocking_read(&mut pin_bat, sample_time);
         let raw_t1 = adc.blocking_read(&mut pin_t1, sample_time);
-        let _raw_t2 = adc.blocking_read(&mut pin_t2, sample_time); // Просто чтение для примера
+        let raw_t2 = adc.blocking_read(&mut pin_t2, sample_time); // Просто чтение для примера
 
         let current_door_state = pin_door.is_low();
 
@@ -125,10 +127,16 @@ pub async fn sensors_task(
 
         // Получаем температуру в градусах Цельсия
         let temp_c1 = calc_temperature(raw_t1) + TEMP_T1_OFFSET; // 2.0 - Калибровочный сдвиг под точку 25°C
+        let _temp_c2 = calc_temperature(raw_t2) + TEMP_T1_OFFSET; // 2.0 - Калибровочный сдвиг под точку 25°C
 
         let mut diag_buf = heapless::String::new();
         // Записываем bat_voltage вместо raw_to_volts(raw_bat) * 3.0
         core::write!(&mut diag_buf, "BAT: {:.2}V T1:{:.0}C", bat_voltage, temp_c1).unwrap();
+
+        // // Передача напряжения мод1 в задачу энкодера для динамического шага
+        // let voltage_mv = (voltage_m1 * 1000.0) as i32;
+        // // Обновляем глобальную переменную без всяких блокировок (мгновенно)
+        // crate::U1_ACTUAL_MV.store(voltage_mv, Ordering::Relaxed);
 
         let telemetry_data = crate::display::Telemetry {
             mod1_v: voltage_m1,

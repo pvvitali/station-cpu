@@ -30,8 +30,7 @@ fn crc_8(data: &[u8]) -> u8 {
 
 macro_rules! send_at {
     ($uart:expr, $rx_buf:expr, $cmd:expr, $expected:expr, $wait_ms:expr) => {{
-        // 1. ИСПРАВЛЕНИЕ: Вычитываем буфер ДОСУХА (пока не наступит таймаут)
-        // Это гарантирует, что мы не поймаем старые ответы от прошлых сессий!
+        // Вычитываем буфер досуха (пока не наступит таймаут)
         while let Ok(_) = with_timeout(
             Duration::from_millis(50),
             $uart.read_until_idle(&mut $rx_buf),
@@ -43,7 +42,6 @@ macro_rules! send_at {
         if $uart.write_all($cmd).await.is_ok() {
             let start = embassy_time::Instant::now();
             while start.elapsed().as_millis() < $wait_ms as u64 {
-                // Вычисляем, сколько времени осталось ждать ответа
                 let elapsed = start.elapsed().as_millis() as u64;
                 let remaining = if $wait_ms as u64 > elapsed { $wait_ms as u64 - elapsed } else { 10 };
 
@@ -133,17 +131,11 @@ pub async fn gsm_task(
             let _ =
                 with_timeout(Duration::from_millis(50), uart.read_until_idle(&mut rx_buf)).await;
             let _ = uart.write_all(b"AT+CPIN?\r\n").await;
-            if let Ok(Ok(len)) = with_timeout(
+            let _ = with_timeout(
                 Duration::from_millis(1000),
                 uart.read_until_idle(&mut rx_buf),
             )
-            .await
-            {
-                if let Ok(resp) = str::from_utf8(&rx_buf[..len]) {
-                    // Раскомментируйте строку ниже, если захотите видеть статус симки
-                    // info!("GSM SIM Status: {}", resp.trim());
-                }
-            }
+            .await;
 
             let _ = uart.write_all(b"AT+CEREG?\r\n").await;
             if let Ok(Ok(len)) = with_timeout(
@@ -185,6 +177,11 @@ pub async fn gsm_task(
         send_at!(uart, rx_buf, b"AT+CGDCONT=1,\"IP\",\"www\"\r\n", "OK", 2000);
         send_at!(uart, rx_buf, b"AT+CGACT=1,1\r\n", "OK", 5000);
 
+        // ПРИНУДИТЕЛЬНАЯ ОЧИСТКА: Закрываем старые соединения перед открытием новых
+        info!("GSM: Очистка старых сессий...");
+        let _ = send_at!(uart, rx_buf, b"AT+CIPCLOSE=0\r\n", "OK", 1500);
+        let _ = send_at!(uart, rx_buf, b"AT+NETCLOSE\r\n", "OK", 1500);
+
         let _ = send_at!(uart, rx_buf, b"AT+NETOPEN\r\n", "OK", 5000);
         Timer::after_secs(1).await;
 
@@ -200,15 +197,25 @@ pub async fn gsm_task(
             info!("GSM: Успешно подключено к серверу!");
 
             loop {
+                // Читаем реальные данные с датчиков (милливольты)
+                let u1_mv = crate::U1_ACTUAL_MV.load(core::sync::atomic::Ordering::Relaxed);
+                let i1_mv = crate::I1_ACTUAL_MV.load(core::sync::atomic::Ordering::Relaxed);
+                let p1_mv = crate::P1_ACTUAL_MV.load(core::sync::atomic::Ordering::Relaxed);
+
+                // Форматируем для сервера (напряжение и ток /100, потенциал /10)
+                let u_str = u1_mv / 100;
+                let i_str = i1_mv / 100;
+                let p_str = p1_mv / 10;
+
                 let mut payload = String::<256>::new();
                 core::fmt::write(
                     &mut payload,
                     format_args!(
                         "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|",
                         "10000600",
-                        "0",
-                        "0",
-                        "0",
+                        i_str,
+                        u_str,
+                        p_str,
                         "0",
                         "24",
                         "0",
@@ -225,7 +232,6 @@ pub async fn gsm_task(
                 .unwrap();
 
                 let crc = crc_8(payload.as_bytes());
-                // 2. ИСПРАВЛЕНИЕ: Убрали \x1A. Оставляем только точку с запятой!
                 core::fmt::write(&mut payload, format_args!("{};", crc)).unwrap();
 
                 // Формируем команду CIPSEND с указанием точной длины пакета
@@ -234,7 +240,7 @@ pub async fn gsm_task(
                     .unwrap();
 
                 if send_at!(uart, rx_buf, cmd.as_bytes(), ">", 2000) {
-                    info!("GSM: Отправка пакета ({} байт)...", payload.len());
+                    info!("GSM: Отправка телеметрии ({} байт)...", payload.len());
 
                     if send_at!(uart, rx_buf, payload.as_bytes(), "OK", 10000) {
                         info!("GSM: Пакет успешно отправлен!");
@@ -249,7 +255,6 @@ pub async fn gsm_task(
 
                 info!("GSM: Ожидание 60 сек. Слушаем ответы сервера...");
 
-                // 3. ИСПРАВЛЕНИЕ: Вместо "глухого" сна, активно читаем буфер
                 let wait_start = embassy_time::Instant::now();
                 while wait_start.elapsed().as_secs() < 60 {
                     if let Ok(Ok(len)) = with_timeout(
@@ -261,7 +266,7 @@ pub async fn gsm_task(
                         if let Ok(resp) = str::from_utf8(&rx_buf[..len]) {
                             let text = resp.trim();
                             if !text.is_empty() {
-                                // Печатаем все, что приходит от сервера!
+                                // Выводим команды от сервера в консоль
                                 info!("GSM <- SERVER MSG: {}", text);
                             }
                         }

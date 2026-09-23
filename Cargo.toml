@@ -18,6 +18,7 @@ embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "execu
 embassy-time = { version = "0.5.1", features = ["defmt", "defmt-timestamp-uptime"] }
 embassy-stm32 = { version = "0.6.0", features = ["stm32f412rg", "memory-x", "time-driver-any", "exti", "defmt", "unstable-pac"] }
 embassy-sync = { version = "0.8.0", features = ["defmt"] } # <-- ДОБАВЛЕНО для Channel и Mutex
+embassy-futures = "0.1"
 
 # --- НОВЫЕ ЗАВИСИМОСТИ ---
 
@@ -32,3 +33,11 @@ heapless = "0.9.3"
 
 micromath = "2.1"
 embedded-io-async = { version = "0.7.0", default-features = false }
+
+# Оптимизируем все сторонние библиотеки даже в режиме Debug
+#[profile.dev.package."*"]
+#opt-level = "s"
+
+# Оптимизируем ядро языка (core/alloc)
+#[profile.dev.build-override]
+#opt-level = "s"

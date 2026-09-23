@@ -18,6 +18,9 @@ use embassy_stm32::gpio::{Input, Level, Output, Pull, Speed};
 use embassy_stm32::interrupt;
 use embassy_stm32::mode::Async;
 use embassy_time::{Duration, Timer, with_timeout}; // Добавляем импорт модуля прерываний
+// gsm
+//use embassy_stm32::gpio::{Input, Level, Output, Pull, Speed}; // Убедитесь, что импорты на месте
+
 //
 use core::sync::atomic::{AtomicBool, Ordering};
 //
@@ -47,9 +50,20 @@ use core::sync::atomic::AtomicI32;
 //use core::sync::atomic::Ordering;
 // Глобальная переменная для напряжения U1 (в милливольтах)
 pub static U1_ACTUAL_MV: AtomicI32 = AtomicI32::new(0);
+pub static I1_ACTUAL_MV: AtomicI32 = AtomicI32::new(0);
+pub static P1_ACTUAL_MV: AtomicI32 = AtomicI32::new(0);
 
 //bluetooth
 mod bluetooth;
+
+//rs485
+mod rs485;
+
+//Dwin display
+mod dwin;
+
+//Gsm
+mod gsm;
 
 // Явная привязка аппаратных линий прерываний к драйверу EXTI.
 // Это требование новых версий для безопасной обработки IRQ под капотом.
@@ -244,6 +258,16 @@ async fn main(spawner: Spawner) {
     // Init pin rele
     let _rele = Output::new(p.PC13, Level::Low, Speed::Low);
 
+    // Init pins gsm
+    // Инициализация обвязки GSM-модема A7682E
+    let gsm_pwrkey = Output::new(p.PA8, Level::Low, Speed::Low);
+    let gsm_reset = Output::new(p.PA11, Level::Low, Speed::Low);
+    let gsm_dtr = Output::new(p.PC8, Level::Low, Speed::Low);
+    //
+    // Входы. Транслятор TXS0108E подтягивает уровни сам, поэтому Pull::None
+    let gsm_status = Input::new(p.PA12, Pull::None);
+    let gsm_ring = Input::new(p.PC9, Pull::None);
+
     info!("Станция катодной защиты: Система питания инициализирована!");
 
     // =========================================================
@@ -360,6 +384,27 @@ async fn main(spawner: Spawner) {
     // Запускаем задачу Bluetooth
     // Запускаем задачу Bluetooth (сначала USART, потом RX, потом TX)
     spawner.spawn(bluetooth::bluetooth_task(p.USART2, p.PA3, p.PA2).unwrap());
+
+    // Запускаем RS485: USART3, RX (PC11), TX (PC10), RW (PC12)
+    spawner.spawn(rs485::rs485_task(p.USART3, p.PC11, p.PC10, p.PC12).unwrap());
+
+    // Запускаем DWIN LCD: USART6, RX (PC7), TX (PC6) + DMA каналы
+    spawner.spawn(
+        dwin::dwin_task(
+            p.USART6, p.PC7, p.PC6, p.DMA2_CH1, // Канал DMA для приема (RX)
+            p.DMA2_CH6, // Канал DMA для передачи (TX)
+        )
+        .unwrap(),
+    );
+
+    // Запускаем задачу GSM
+    spawner.spawn(
+        gsm::gsm_task(
+            p.USART1, p.PA10, p.PA9, p.DMA2_CH2, p.DMA2_CH7, gsm_pwrkey, gsm_reset, gsm_dtr,
+            gsm_status, gsm_ring,
+        )
+        .unwrap(),
+    );
 
     loop {
         Timer::after_millis(5000).await;

@@ -1,4 +1,5 @@
 use core::fmt::Write;
+use core::sync::atomic::Ordering;
 use embassy_stm32::adc::{Adc, AnyAdcChannel, SampleTime};
 use embassy_stm32::gpio::Input;
 use embassy_stm32::peripherals::ADC1;
@@ -133,10 +134,20 @@ pub async fn sensors_task(
         // Записываем bat_voltage вместо raw_to_volts(raw_bat) * 3.0
         core::write!(&mut diag_buf, "BAT: {:.2}V T1:{:.0}C", bat_voltage, temp_c1).unwrap();
 
-        // // Передача напряжения мод1 в задачу энкодера для динамического шага
-        // let voltage_mv = (voltage_m1 * 1000.0) as i32;
-        // // Обновляем глобальную переменную без всяких блокировок (мгновенно)
-        // crate::U1_ACTUAL_MV.store(voltage_mv, Ordering::Relaxed);
+        // Передача напряжения мод1 в другие задачи
+        let voltage_mv = (voltage_m1 * 1000.0) as i32;
+        // Обновляем глобальную переменную без всяких блокировок (мгновенно)
+        crate::U1_ACTUAL_MV.store(voltage_mv, Ordering::Relaxed);
+        //
+        // Передача i мод1 в другие задачи
+        let current_mv = (i1_filtered * 1000.0) as i32;
+        // Обновляем глобальную переменную без всяких блокировок (мгновенно)
+        crate::I1_ACTUAL_MV.store(current_mv, Ordering::Relaxed);
+        //
+        // Передача i мод1 в другие задачи
+        let potencial_mv = (voltage_p * 1000.0) as i32;
+        // Обновляем глобальную переменную без всяких блокировок (мгновенно)
+        crate::P1_ACTUAL_MV.store(potencial_mv, Ordering::Relaxed);
 
         let telemetry_data = crate::display::Telemetry {
             mod1_v: voltage_m1,

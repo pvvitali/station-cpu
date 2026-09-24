@@ -45,6 +45,8 @@ use embassy_stm32::timer::simple_pwm::{PwmPin, SimplePwm};
 static POWER_SOURCE: AtomicBool = AtomicBool::new(false);
 // Флаг ошибки заряда
 static BATT_ERROR: AtomicBool = AtomicBool::new(false);
+// Флаг стабильности питания (false = идут переходные процессы, измерения на паузе)
+pub static POWER_STABLE: AtomicBool = AtomicBool::new(true);
 
 use core::sync::atomic::AtomicI32;
 //use core::sync::atomic::Ordering;
@@ -72,33 +74,62 @@ bind_interrupts!(struct Irqs {
     EXTI1 => exti::InterruptHandler<interrupt::typelevel::EXTI1>;
 });
 
-// --- Задача 1: Мониторинг наличия сетевого питания (PG) ---
 #[embassy_executor::task]
-async fn monitor_power_good(mut pg: ExtiInput<'static, Async>) {
-    // 1. ИНИЦИАЛИЗАЦИЯ: Читаем фактическое состояние при старте
+async fn monitor_power_good(mut pg: ExtiInput<'static, Async>, mut otg: Output<'static>) {
+    otg.set_low();
+    Timer::after_millis(100).await;
+
+    let mut is_battery_mode;
+
     if pg.is_low() {
         POWER_SOURCE.store(false, Ordering::Relaxed);
-        info!("[ПИТАНИЕ] СТАРТ: Внешнее напряжение подключено! (PG = 0)");
+        info!("[ПИТАНИЕ] СТАРТ: Внешнее напряжение 12В подключено! (PG = 0)");
+        is_battery_mode = false;
     } else {
         POWER_SOURCE.store(true, Ordering::Relaxed);
+        otg.set_high();
         warn!("[ПИТАНИЕ] СТАРТ: Работаем от АКБ! (PG = 1)");
+        is_battery_mode = true;
     }
 
-    // 2. РАБОЧИЙ ЦИКЛ
     loop {
-        // Ждем любого перепада (события)
-        pg.wait_for_any_edge().await;
+        if is_battery_mode {
+            Timer::after_secs(3).await;
 
-        // Сначала ждем 50 мс, чтобы сигнал "успокоился" (антидребезг)
-        Timer::after_millis(50).await;
+            // --- НАЧАЛО НЕСТАБИЛЬНОЙ ЗОНЫ ---
+            POWER_STABLE.store(false, Ordering::Relaxed); // Ставим АЦП на паузу
+            otg.set_low();
 
-        // Только теперь читаем стабилизировавшийся уровень
-        if pg.is_low() {
-            POWER_SOURCE.store(false, Ordering::Relaxed);
-            info!("[ПИТАНИЕ] Внешнее напряжение подключено! (PG = 0)");
+            Timer::after_millis(35).await; // Снизили с 50 до 35 мс (предел по даташиту)
+
+            if pg.is_low() {
+                POWER_SOURCE.store(false, Ordering::Relaxed);
+                is_battery_mode = false;
+                info!("[ПИТАНИЕ] Внешнее напряжение 12В восстановлено! (PG = 0)");
+
+                Timer::after_millis(350).await; // Даем 12В зарядить конденсаторы
+                POWER_STABLE.store(true, Ordering::Relaxed); // Снимаем АЦП с паузы
+            } else {
+                otg.set_high(); // 12В нет, возвращаем 5В из АКБ
+                Timer::after_millis(350).await; // Даем DC-DC время поднять напряжение до 5В
+                POWER_STABLE.store(true, Ordering::Relaxed); // Снимаем АЦП с паузы
+            }
+            // --- КОНЕЦ НЕСТАБИЛЬНОЙ ЗОНЫ ---
         } else {
-            POWER_SOURCE.store(true, Ordering::Relaxed);
-            warn!("[ПИТАНИЕ] Переход на резервную АКБ! (PG = 1)");
+            pg.wait_for_high().await;
+            Timer::after_millis(10).await;
+
+            if pg.is_high() {
+                POWER_STABLE.store(false, Ordering::Relaxed); // Пауза
+
+                otg.set_high();
+                POWER_SOURCE.store(true, Ordering::Relaxed);
+                is_battery_mode = true;
+                warn!("[ПИТАНИЕ] Отключение 12В! Переход на резервную АКБ! (PG = 1)");
+
+                Timer::after_millis(20).await; // Ждем стабилизации 5В
+                POWER_STABLE.store(true, Ordering::Relaxed); // Снимаем с паузы
+            }
         }
     }
 }
@@ -243,7 +274,8 @@ async fn main(spawner: Spawner) {
 
     // 2. OTG (PC2) - Управление повышающим преобразователем.
     // Внешняя подтяжка к GND 10 кОм уже есть на плате.
-    let _otg_pin = Output::new(p.PC2, Level::High, Speed::Low);
+    // 2. OTG (PC2) - Инициализируем в LOW, чтобы не блокировать 12В
+    let otg_pin = Output::new(p.PC2, Level::Low, Speed::Low);
 
     // 3. PG (PC0) и STAT (PC1).
     // Внешние подтяжки 100 кОм к 3.3В, поэтому внутри МК используем Pull::None.
@@ -260,13 +292,13 @@ async fn main(spawner: Spawner) {
 
     // Init pins gsm
     // Инициализация обвязки GSM-модема A7682E
-    let gsm_pwrkey = Output::new(p.PA8, Level::Low, Speed::Low);
-    let gsm_reset = Output::new(p.PA11, Level::Low, Speed::Low);
-    let gsm_dtr = Output::new(p.PC8, Level::Low, Speed::Low);
+    let _gsm_pwrkey = Output::new(p.PA8, Level::Low, Speed::Low);
+    let _gsm_reset = Output::new(p.PA11, Level::Low, Speed::Low);
+    let _gsm_dtr = Output::new(p.PC8, Level::Low, Speed::Low);
     //
     // Входы. Транслятор TXS0108E подтягивает уровни сам, поэтому Pull::None
-    let gsm_status = Input::new(p.PA12, Pull::None);
-    let gsm_ring = Input::new(p.PC9, Pull::None);
+    let _gsm_status = Input::new(p.PA12, Pull::None);
+    let _gsm_ring = Input::new(p.PC9, Pull::None);
 
     info!("Станция катодной защиты: Система питания инициализирована!");
 
@@ -338,7 +370,9 @@ async fn main(spawner: Spawner) {
     // Макрос #[task] возвращает Result<SpawnToken, SpawnError>,
     // поэтому распаковываем токен (unwrap) перед передачей в spawner.
     spawner.spawn(blink_led(led_pin).unwrap());
-    spawner.spawn(monitor_power_good(pg_pin).unwrap());
+    // Передаем otg_pin в задачу мониторинга
+    spawner.spawn(monitor_power_good(pg_pin, otg_pin).unwrap());
+    //
     spawner.spawn(monitor_charge_status(stat_pin).unwrap());
     // Запускаем менеджер индикации
     spawner.spawn(led_manager(led_ext_pin, led_batt_pin).unwrap());
@@ -397,14 +431,14 @@ async fn main(spawner: Spawner) {
         .unwrap(),
     );
 
-    // Запускаем задачу GSM
-    spawner.spawn(
-        gsm::gsm_task(
-            p.USART1, p.PA10, p.PA9, p.DMA2_CH2, p.DMA2_CH7, gsm_pwrkey, gsm_reset, gsm_dtr,
-            gsm_status, gsm_ring,
-        )
-        .unwrap(),
-    );
+    // // Запускаем задачу GSM
+    // spawner.spawn(
+    //     gsm::gsm_task(
+    //         p.USART1, p.PA10, p.PA9, p.DMA2_CH2, p.DMA2_CH7, gsm_pwrkey, gsm_reset, gsm_dtr,
+    //         gsm_status, gsm_ring,
+    //     )
+    //     .unwrap(),
+    // );
 
     loop {
         Timer::after_millis(5000).await;

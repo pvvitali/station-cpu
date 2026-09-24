@@ -88,6 +88,11 @@ pub async fn sensors_task(
     let mut i2_filtered: f32 = 0.0;
 
     loop {
+        // 1. Если питание нестабильно, просто ждем 100 мс и пропускаем цикл измерений
+        if !crate::POWER_STABLE.load(core::sync::atomic::Ordering::Relaxed) {
+            Timer::after_millis(350).await;
+            continue;
+        }
         // Читаем АЦП
         let raw_p = adc.blocking_read(&mut pin_p, sample_time);
         let raw_m1_v = adc.blocking_read(&mut pin_m1_v, sample_time);
@@ -97,6 +102,13 @@ pub async fn sensors_task(
         let raw_bat = adc.blocking_read(&mut pin_bat, sample_time);
         let raw_t1 = adc.blocking_read(&mut pin_t1, sample_time);
         let raw_t2 = adc.blocking_read(&mut pin_t2, sample_time); // Просто чтение для примера
+
+        // 2. ФИНАЛЬНАЯ ПРОВЕРКА: не сломалось ли питание, пока мы читали?
+        if !crate::POWER_STABLE.load(core::sync::atomic::Ordering::Relaxed) {
+            // Питание дрогнуло в процессе! Выбрасываем замеры, не обновляем фильтры.
+            Timer::after_millis(10).await;
+            continue;
+        }
 
         let current_door_state = pin_door.is_low();
 
@@ -166,6 +178,6 @@ pub async fn sensors_task(
             .send(crate::display::DisplayCmd::Update(telemetry_data))
             .await;
 
-        Timer::after_millis(200).await;
+        Timer::after_millis(300).await;
     }
 }

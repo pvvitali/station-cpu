@@ -105,7 +105,11 @@ pub async fn gsm_task(
         }
         if status.is_low() {
             error!("GSM: Ошибка запуска! STATUS не поднялся.");
+        } else {
+            info!("STATUS is high! OK!");
         }
+    } else {
+        info!("STATUS is high in on module");
     }
     Timer::after_secs(3).await;
 
@@ -174,6 +178,7 @@ pub async fn gsm_task(
         }
 
         info!("GSM: Регистрация успешна! Настраиваем APN...");
+
         send_at!(uart, rx_buf, b"AT+CGDCONT=1,\"IP\",\"www\"\r\n", "OK", 2000);
         send_at!(uart, rx_buf, b"AT+CGACT=1,1\r\n", "OK", 5000);
 

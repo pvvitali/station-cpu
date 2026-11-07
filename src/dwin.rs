@@ -30,6 +30,20 @@ async fn dwin_write_float<W: Write>(uart: &mut W, addr: u16, value: f32) {
     let _ = uart.write_all(&buf).await;
 }
 
+async fn dwin_write_int16<W: Write>(uart: &mut W, addr: u16, value: u16) {
+    let buf = [
+        0x5A,
+        0xA5,
+        0x05, // Длина оставшейся части пакета
+        0x82, // Команда записи
+        (addr >> 8) as u8,
+        (addr & 0xFF) as u8,
+        (value >> 8) as u8,
+        (value & 0xFF) as u8,
+    ];
+    let _ = uart.write_all(&buf).await;
+}
+
 #[embassy_executor::task]
 pub async fn dwin_task(
     usart6: Peri<'static, peripherals::USART6>,
@@ -71,7 +85,11 @@ pub async fn dwin_task(
                                         let data = ((pkt[7] as u16) << 8) | (pkt[8] as u16);
 
                                         match addr {
-                                            0x5012 => info!("-> Изменение ШИМ: {}", data),
+                                            0x5012 => {
+                                                info!("-> Изменение ШИМ: {}", data);
+                                                // Отправляем значение от экрана в канал управления ШИМ
+                                                let _ = crate::PWM_CHANNEL.try_send(data as u32);
+                                            }
                                             0x5017 => info!("-> Аккумулятор: {}", data),
                                             0x5030 => info!("-> SIM800: {}", data),
                                             _ => {}
@@ -94,16 +112,53 @@ pub async fn dwin_task(
         loop {
             Timer::after(Duration::from_millis(300)).await;
 
+            // --- 1. ЧТЕНИЕ ДАННЫХ ИЗ ГЛОБАЛЬНЫХ ПЕРЕМЕННЫХ ---
             let u1_mv = crate::U1_ACTUAL_MV.load(Ordering::Relaxed);
             let voltage_v = (u1_mv as f32) / 1000.0;
             let i1_mv = crate::I1_ACTUAL_MV.load(Ordering::Relaxed);
             let current_v = (i1_mv as f32) / 1000.0;
             let p1_mv = crate::P1_ACTUAL_MV.load(Ordering::Relaxed);
             let potencial_v = (p1_mv as f32) / 1000.0;
+            let current_pwm = crate::PWM1_ACTUAL.load(Ordering::Relaxed) as u16;
 
+            // Новые данные
+            let bat_v = (crate::BAT_VOLTAGE_MV.load(Ordering::Relaxed) as f32) / 1000.0;
+            let temp_c = (crate::TEMP_C_X10.load(Ordering::Relaxed) as f32) / 10.0;
+            let door_val: u16 = if crate::DOOR_CLOSED.load(Ordering::Relaxed) {
+                1
+            } else {
+                0
+            };
+            let csq = crate::GSM_SIGNAL.load(Ordering::Relaxed) as u16;
+            let gsm_status: u16 = if crate::GSM_OK.load(Ordering::Relaxed) {
+                1
+            } else {
+                0
+            };
+
+            // --- 2. ОТПРАВКА FLOAT ЗНАЧЕНИЙ ---
             dwin_write_float(&mut tx, 0x5000, voltage_v).await;
             dwin_write_float(&mut tx, 0x5002, current_v).await;
             dwin_write_float(&mut tx, 0x5004, potencial_v).await;
+            dwin_write_float(&mut tx, 0x5024, bat_v).await; // Напряжение батареи
+            dwin_write_float(&mut tx, 0x5028, temp_c).await; // Температура
+
+            // --- 3. ОТПРАВКА INT16 ЗНАЧЕНИЙ ---
+            dwin_write_int16(&mut tx, 0x5012, current_pwm).await;
+            dwin_write_int16(&mut tx, 0x5016, door_val).await; // Дверь
+            dwin_write_int16(&mut tx, 0x5026, csq).await; // Антенна GSM (уровень)
+
+            // Статусы GSM
+            dwin_write_int16(&mut tx, 0x5020, gsm_status).await; // GSM OK
+            dwin_write_int16(&mut tx, 0x5021, gsm_status).await; // Server OK
+
+            // Статичные переключатели (всегда включены на нашей плате)
+            dwin_write_int16(&mut tx, 0x5017, 1).await; // Батарея (вкл)
+            dwin_write_int16(&mut tx, 0x5022, 1).await; // Батарея (иконка)
+            dwin_write_int16(&mut tx, 0x5030, 1).await; // GSM переключатель (вкл)
+
+            // Если для Bluetooth есть свой адрес в DGUS (например, 0x5032), добавь:
+            // dwin_write_int16(&mut tx, 0x5032, 1).await;
         }
     };
 

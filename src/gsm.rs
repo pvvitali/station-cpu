@@ -217,7 +217,7 @@ pub async fn gsm_task(
                     &mut payload,
                     format_args!(
                         "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|",
-                        "10000600",
+                        "10001005",
                         i_str,
                         u_str,
                         p_str,

@@ -16,14 +16,27 @@ fn raw_to_volts(raw: u16) -> f32 {
 }
 
 fn calc_real_voltage(adc_v: f32) -> f32 {
-    // 1. Считаем базовое теоретическое значение
+    // // 1. Считаем базовое теоретическое значение
+    // let v_theoretical = adc_v * 30.125;
+
+    // // 2. Применяем линейную калибровку по измеренным точкам
+    // // Формула: Y = k * X + b
+    // let mut v_real = (v_theoretical * 1.02145) - 0.32686;
+
+    // // 3. Отсекаем микро-шумы ниже нуля (чтобы на экране не было -0.01V)
+    // if v_real < 0.0 {
+    //     v_real = 0.0;
+    // }
+
+    // v_real
+
+    // 1. Считаем базовое теоретическое значение от аппаратного делителя
     let v_theoretical = adc_v * 30.125;
 
-    // 2. Применяем линейную калибровку по измеренным точкам
-    // Формула: Y = k * X + b
-    let mut v_real = (v_theoretical * 1.02145) - 0.32686;
+    // 2. Применяем новую калибровку, рассчитанную по замерам мультиметра
+    let mut v_real = (v_theoretical * 1.01) - 0.303;
 
-    // 3. Отсекаем микро-шумы ниже нуля (чтобы на экране не было -0.01V)
+    // 3. Отсекаем микро-шумы ниже нуля (чтобы на экране не было минуса при 0 В)
     if v_real < 0.0 {
         v_real = 0.0;
     }
@@ -160,6 +173,17 @@ pub async fn sensors_task(
         let potencial_mv = (voltage_p * 1000.0) as i32;
         // Обновляем глобальную переменную без всяких блокировок (мгновенно)
         crate::P1_ACTUAL_MV.store(potencial_mv, Ordering::Relaxed);
+
+        // ... (после вычисления bat_voltage и temp_c1)
+        let bat_mv = (bat_voltage * 1000.0) as u32;
+        crate::BAT_VOLTAGE_MV.store(bat_mv, Ordering::Relaxed);
+
+        let temp_x10 = (temp_c1 * 10.0) as i32;
+        crate::TEMP_C_X10.store(temp_x10, Ordering::Relaxed);
+
+        // Сохраняем состояние двери (в С-коде 1 - закрыто, 0 - открыто)
+        // Если логика инвертирована, поменяй на !current_door_state
+        crate::DOOR_CLOSED.store(current_door_state, Ordering::Relaxed);
 
         let telemetry_data = crate::display::Telemetry {
             mod1_v: voltage_m1,

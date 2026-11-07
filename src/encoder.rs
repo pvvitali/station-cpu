@@ -1,9 +1,13 @@
+use core::sync::atomic::Ordering;
 use defmt::info;
 use embassy_stm32::gpio::Input;
 use embassy_stm32::peripherals::{TIM3, TIM4};
 use embassy_stm32::timer::qei::Qei;
 use embassy_stm32::timer::simple_pwm::SimplePwm;
 use embassy_time::{Duration, Timer};
+
+// Подключаем глобальные переменные из main.rs
+use crate::{PWM_CHANNEL, PWM1_ACTUAL};
 
 #[embassy_executor::task]
 pub async fn encoder_task(
@@ -13,53 +17,67 @@ pub async fn encoder_task(
     max_duty: u32,
 ) {
     let mut last_count = qei.count();
-    let mut absolute_raw: i32 = 0;
-    let mut last_ui_position: u32 = 0;
 
+    // Внутреннее состояние ШИМ, умноженное на 4 для сглаживания "тиков" энкодера
+    let mut absolute_raw: i32 = 0;
     let limit_min: i32 = 0;
-    let limit_max: i32 = (max_duty * 4) as i32;
+    let limit_max: i32 = 1001 * 4;
     let mut btn_was_pressed = false;
 
-    info!("Encoder task with speed acceleration started!");
+    info!("Encoder & PWM Manager task started!");
 
     loop {
         Timer::after(Duration::from_millis(20)).await;
+        let mut duty_changed = false;
 
+        // 1. Проверяем команды из канала (от DWIN или GSM)
+        if let Ok(new_pwm_val) = PWM_CHANNEL.try_receive() {
+            absolute_raw = (new_pwm_val as i32).clamp(0, 1001) * 4;
+            duty_changed = true;
+        }
+
+        // 2. Проверяем физический энкодер
         let current_count = qei.count();
         if current_count != last_count {
             let delta = current_count.wrapping_sub(last_count) as i16;
             last_count = current_count;
 
-            // 1. ВЫЧИСЛЯЕМ СКОРОСТЬ
-            // Делим на 4, чтобы получить количество реальных щелчков за 20 мс.
-            // Метод max(1) спасает от умножения на 0 при случайном дребезге в 1-2 тика.
             let speed_clicks = (delta.abs() / 4).max(1) as i32;
-
-            // 2. ФОРМИРУЕМ МНОЖИТЕЛЬ
-            // Базовый шаг 10. Если крутануть быстро (2+ щелчка), множитель пропорционально растет.
-            let step_multiplier = 10 * speed_clicks;
-
-            // 3. ПРИМЕНЯЕМ УСКОРЕНИЕ
+            let step_multiplier = 2 * speed_clicks;
             let accelerated_delta = (delta as i32) * step_multiplier;
-            absolute_raw = (absolute_raw + accelerated_delta).clamp(limit_min, limit_max);
 
-            let ui_position = (absolute_raw / 4) as u32;
+            let next_raw = absolute_raw + accelerated_delta;
+            let clamped_raw = next_raw.clamp(limit_min, limit_max);
 
-            if ui_position != last_ui_position {
-                pwm.ch1().set_duty_cycle(ui_position);
-
-                info!(
-                    "U1 PWM: {} | Скорость: {} щелчков/такт | Шаг x{}",
-                    ui_position, speed_clicks, step_multiplier
-                );
-
-                last_ui_position = ui_position;
+            if clamped_raw != absolute_raw {
+                absolute_raw = clamped_raw;
+                duty_changed = true;
             }
         }
 
+        // 3. Применяем новое значение к железу, если оно изменилось
+        if duty_changed {
+            let logical_duty = (absolute_raw / 4) as u32;
+
+            // Масштабируем 0..1001 в 0..max_duty
+            let hardware_duty = ((logical_duty as u64 * max_duty as u64) / 1001) as u32;
+
+            pwm.ch1().set_duty_cycle(hardware_duty);
+
+            // Публикуем новое логическое значение для отправки в GSM и обратно в DWIN
+            PWM1_ACTUAL.store(logical_duty, Ordering::Relaxed);
+
+            info!(
+                "PWM Обновлен | Логика: {}/1001 | Аппаратный: {}/{}",
+                logical_duty, hardware_duty, max_duty
+            );
+        }
+
+        // 4. Обработка кнопки
         let btn_is_pressed = pin_btn.is_low();
         if btn_is_pressed && !btn_was_pressed {
-            info!("Кнопка нажата!");
+            info!("Кнопка энкодера нажата!");
+            // Позже сюда можно добавить логику сброса ШИМ или перехода в меню
         }
         btn_was_pressed = btn_is_pressed;
     }

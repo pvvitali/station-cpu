@@ -55,6 +55,24 @@ pub static U1_ACTUAL_MV: AtomicI32 = AtomicI32::new(0);
 pub static I1_ACTUAL_MV: AtomicI32 = AtomicI32::new(0);
 pub static P1_ACTUAL_MV: AtomicI32 = AtomicI32::new(0);
 
+// Телеметрия для экранов
+pub static DOOR_CLOSED: AtomicBool = AtomicBool::new(true);
+pub static BAT_VOLTAGE_MV: AtomicU32 = AtomicU32::new(0);
+pub static TEMP_C_X10: AtomicI32 = AtomicI32::new(0); // Градусы * 10
+pub static GSM_SIGNAL: AtomicU32 = AtomicU32::new(0); // Сигнал CSQ
+pub static GSM_OK: AtomicBool = AtomicBool::new(false); // Статус подключения
+
+// PWM atomic
+use core::sync::atomic::AtomicU32;
+use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
+use embassy_sync::channel::Channel;
+//
+// Глобальная переменная для чтения текущего логического ШИМ (0..1001)
+pub static PWM1_ACTUAL: AtomicU32 = AtomicU32::new(0);
+//
+// Канал команд. Сюда DWIN и GSM будут кидать новые целевые значения (0..1001).
+pub static PWM_CHANNEL: Channel<ThreadModeRawMutex, u32, 4> = Channel::new();
+
 //bluetooth
 mod bluetooth;
 
@@ -354,6 +372,10 @@ async fn main(spawner: Spawner) {
     // Получаем потолок из любого канала
     let max_duty = pwm.ch1().max_duty_cycle();
 
+    //начальное значения для тока (модуля 1)
+    let max_duty2 = pwm.ch2().max_duty_cycle();
+    pwm.ch2().set_duty_cycle((max_duty2 / 3) as u32);
+
     //----------------------------------------------------------------------------------
 
     // Энкодер (аппаратный таймер TIM3)
@@ -431,7 +453,7 @@ async fn main(spawner: Spawner) {
         .unwrap(),
     );
 
-    // // Запускаем задачу GSM
+    // Запускаем задачу GSM
     // spawner.spawn(
     //     gsm::gsm_task(
     //         p.USART1, p.PA10, p.PA9, p.DMA2_CH2, p.DMA2_CH7, gsm_pwrkey, gsm_reset, gsm_dtr,

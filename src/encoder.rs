@@ -18,8 +18,10 @@ pub async fn encoder_task(
 ) {
     let mut last_count = qei.count();
 
-    // Внутреннее состояние ШИМ, умноженное на 4 для сглаживания "тиков" энкодера
-    let mut absolute_raw: i32 = 0;
+    // БЕРЕМ ЗНАЧЕНИЕ, ВОССТАНОВЛЕННОЕ ИЗ ФЛЕШ-ПАМЯТИ
+    let initial_logical = PWM1_ACTUAL.load(Ordering::Relaxed) as i32;
+    let mut absolute_raw: i32 = initial_logical.clamp(0, 1001) * 4;
+
     let limit_min: i32 = 0;
     let limit_max: i32 = 1001 * 4;
     let mut btn_was_pressed = false;
@@ -66,6 +68,10 @@ pub async fn encoder_task(
 
             // Публикуем новое логическое значение для отправки в GSM и обратно в DWIN
             PWM1_ACTUAL.store(logical_duty, Ordering::Relaxed);
+
+            //команда для записи во флеш!
+            // Сбрасываем таймер на 10 секунд при каждом изменении (щелчке)
+            crate::FLASH_SAVE_COUNTDOWN.store(10, Ordering::Relaxed);
 
             info!(
                 "PWM Обновлен | Логика: {}/1001 | Аппаратный: {}/{}",

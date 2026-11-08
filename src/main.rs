@@ -73,6 +73,39 @@ pub static PWM1_ACTUAL: AtomicU32 = AtomicU32::new(0);
 // Канал команд. Сюда DWIN и GSM будут кидать новые целевые значения (0..1001).
 pub static PWM_CHANNEL: Channel<ThreadModeRawMutex, u32, 4> = Channel::new();
 
+// --- Новые глобальные переменные ----------------------------------------------------------
+// Энергия (кВт*ч). Храним f32 в виде u32 битов.
+pub static ENERGY_KWH: AtomicU32 = AtomicU32::new(0);
+// Наработка (часы)
+pub static HOURS_WORK: AtomicU32 = AtomicU32::new(0);
+// Второй ШИМ (ток)
+pub static PWM2_ACTUAL: AtomicU32 = AtomicU32::new(333); // 1/3 от 1000
+// Переключатель GSM
+pub static GSM_ON: AtomicBool = AtomicBool::new(true);
+
+// -------------------------------------
+// Флаг запроса на сохранение во флеш (чтобы не писать из каждого места напрямую)
+pub static SAVE_FLASH_REQUEST: AtomicBool = AtomicBool::new(false);
+
+// Таймер отложенного сохранения (в секундах), чтобы не "затирать" флеш при вращении энкодера
+pub static FLASH_SAVE_COUNTDOWN: AtomicU32 = AtomicU32::new(0);
+//---------------------------------------
+
+// --- Структура для сохранения (с Магическим словом) ---
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SavedConfig {
+    pub magic: u32,
+    pub energy_kwh: f32,
+    pub hours_work: u32,
+    pub pwm1_logical: u32,
+    pub pwm2_logical: u32,
+    pub gsm_on: u32, // 1 или 0
+}
+
+const MAGIC_WORD: u32 = 0xAA55AA55;
+//----------------------------------------------------------------------------------------------
+
 //bluetooth
 mod bluetooth;
 
@@ -246,6 +279,141 @@ async fn led_manager(mut led_ext: Output<'static>, mut led_batt: Output<'static>
     }
 }
 
+//задача изменения кВтч и ч раз в час и запрос на запись во флэш
+#[embassy_executor::task]
+pub async fn stats_task() {
+    loop {
+        // Спим 1 час
+        Timer::after(embassy_time::Duration::from_secs(3600)).await;
+
+        let u_mv = crate::U1_ACTUAL_MV.load(Ordering::Relaxed);
+        let i_mv = crate::I1_ACTUAL_MV.load(Ordering::Relaxed);
+
+        let u_v = (u_mv as f32) / 1000.0;
+        let i_v = (i_mv as f32) / 1000.0;
+
+        // Энергия за час: (U * I) / 1000 в кВт*ч
+        let added_kwh = (u_v * i_v) / 1000.0;
+
+        // Читаем, прибавляем, сохраняем обратно
+        let current_bits = ENERGY_KWH.load(Ordering::Relaxed);
+        let current_energy = f32::from_bits(current_bits);
+        let new_energy = current_energy + added_kwh;
+        ENERGY_KWH.store(new_energy.to_bits(), Ordering::Relaxed);
+
+        // Инкремент часов
+        HOURS_WORK.fetch_add(1, Ordering::Relaxed);
+
+        // Даем сигнал менеджеру памяти записать данные во флеш
+        SAVE_FLASH_REQUEST.store(true, Ordering::Relaxed);
+    }
+}
+
+// Задача записи во флэш память (Аппаратный уровень STM32F4)
+#[embassy_executor::task]
+pub async fn flash_manager_task() {
+    let flash_addr: u32 = 0x080E_0000;
+
+    loop {
+        Timer::after(embassy_time::Duration::from_secs(1)).await;
+
+        // Обработка таймера отложенного сохранения
+        let countdown = crate::FLASH_SAVE_COUNTDOWN.load(Ordering::Relaxed);
+        if countdown > 0 {
+            let next = countdown - 1;
+            crate::FLASH_SAVE_COUNTDOWN.store(next, Ordering::Relaxed);
+
+            // Если досчитали до нуля — даем команду на запись
+            if next == 0 {
+                SAVE_FLASH_REQUEST.store(true, Ordering::Relaxed);
+            }
+        }
+
+        if SAVE_FLASH_REQUEST.load(Ordering::Relaxed) {
+            SAVE_FLASH_REQUEST.store(false, Ordering::Relaxed);
+
+            let config = SavedConfig {
+                magic: MAGIC_WORD,
+                energy_kwh: f32::from_bits(ENERGY_KWH.load(Ordering::Relaxed)),
+                hours_work: HOURS_WORK.load(Ordering::Relaxed),
+                pwm1_logical: crate::PWM1_ACTUAL.load(Ordering::Relaxed),
+                pwm2_logical: crate::PWM2_ACTUAL.load(Ordering::Relaxed),
+                gsm_on: if crate::GSM_ON.load(Ordering::Relaxed) {
+                    1
+                } else {
+                    0
+                },
+            };
+
+            // Готовим выровненный буфер (32 байта = 8 слов u32)
+            let mut write_buf = [0xFFFF_FFFFu32; 8];
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    &config as *const _ as *const u8,
+                    write_buf.as_mut_ptr() as *mut u8,
+                    core::mem::size_of::<SavedConfig>(),
+                );
+            }
+
+            info!("Сохранение во флеш (Прямой доступ к регистрам)...");
+
+            unsafe {
+                let flash_keyr = 0x40023C04 as *mut u32;
+                let flash_sr = 0x40023C0C as *mut u32;
+                let flash_cr = 0x40023C10 as *mut u32;
+
+                // 1. Разблокировка флеш-памяти (Unlock)
+                core::ptr::write_volatile(flash_keyr, 0x45670123);
+                core::ptr::write_volatile(flash_keyr, 0xCDEF89AB);
+
+                // Ждем готовности (BSY == 0)
+                while (core::ptr::read_volatile(flash_sr) & (1 << 16)) != 0 {}
+
+                // 2. Стирание сектора 11
+                // SNB = 11 (биты 6:3) -> 11 << 3. SER = 1 (бит 1).
+                let mut cr = core::ptr::read_volatile(flash_cr);
+                cr &= !(0xF << 3); // Очищаем старый номер сектора
+                cr |= (11 << 3) | (1 << 1);
+                core::ptr::write_volatile(flash_cr, cr);
+
+                // Старт стирания (STRT = бит 16)
+                core::ptr::write_volatile(flash_cr, cr | (1 << 16));
+
+                // Ждем завершения стирания
+                while (core::ptr::read_volatile(flash_sr) & (1 << 16)) != 0 {}
+
+                // Отключаем режим стирания
+                cr = core::ptr::read_volatile(flash_cr);
+                core::ptr::write_volatile(flash_cr, cr & !(1 << 1));
+
+                // 3. Запись данных
+                // PSIZE = 32-bit (биты 9:8) -> 2 << 8. PG = 1 (бит 0).
+                cr = core::ptr::read_volatile(flash_cr);
+                cr &= !(3 << 8);
+                cr |= (2 << 8) | (1 << 0);
+                core::ptr::write_volatile(flash_cr, cr);
+
+                let flash_ptr = flash_addr as *mut u32;
+                for i in 0..8 {
+                    core::ptr::write_volatile(flash_ptr.add(i), write_buf[i]);
+                    // Ждем завершения записи слова
+                    while (core::ptr::read_volatile(flash_sr) & (1 << 16)) != 0 {}
+                }
+
+                // Отключаем запись
+                cr = core::ptr::read_volatile(flash_cr);
+                core::ptr::write_volatile(flash_cr, cr & !(1 << 0));
+
+                // 4. Блокируем флеш (LOCK = бит 31)
+                cr = core::ptr::read_volatile(flash_cr);
+                core::ptr::write_volatile(flash_cr, cr | (1 << 31));
+            }
+
+            info!("Сохранение завершено!");
+        }
+    }
+}
+
 //##########################################################################################
 // --- Главный процесс ---
 #[embassy_executor::main]
@@ -287,6 +455,37 @@ async fn main(spawner: Spawner) {
 
     //-----------------------------------------------------------
 
+    // чтение из флэш памяти сохраненых настроек
+    // Создаем драйвер флеш-памяти
+
+    // чтение из флэш памяти сохраненых настроек
+    let flash_addr: u32 = 0x080E_0000; // 1Mb (Сектор 11)
+
+    // Читаем структуру напрямую из памяти
+    let saved_config = unsafe { &*(flash_addr as *const SavedConfig) };
+
+    if saved_config.magic == MAGIC_WORD {
+        info!("Найдена валидная конфигурация во флеш-памяти!");
+        // Восстанавливаем значения
+        ENERGY_KWH.store(saved_config.energy_kwh.to_bits(), Ordering::Relaxed);
+        HOURS_WORK.store(saved_config.hours_work, Ordering::Relaxed);
+        crate::PWM1_ACTUAL.store(saved_config.pwm1_logical, Ordering::Relaxed);
+        crate::PWM2_ACTUAL.store(saved_config.pwm2_logical, Ordering::Relaxed);
+        crate::GSM_ON.store(saved_config.gsm_on == 1, Ordering::Relaxed);
+    } else {
+        info!("Флеш-память пуста или повреждена. Применяем настройки по умолчанию.");
+        // Значения по умолчанию уже заданы при объявлении (PWM1=0, PWM2=333, GSM=true, etc.)
+
+        // Сразу просим фоновую задачу сохранить дефолт во флеш
+        SAVE_FLASH_REQUEST.store(true, Ordering::Relaxed);
+    }
+
+    // Задачи работы с флэш (без передачи аргумента flash)
+    spawner.spawn(stats_task().unwrap());
+    spawner.spawn(flash_manager_task().unwrap());
+
+    //-----------------------------------------------------------
+
     // 1. Настройка светодиода (PB2)
     let led_pin = Output::new(p.PB2, Level::Low, Speed::Low);
 
@@ -310,13 +509,13 @@ async fn main(spawner: Spawner) {
 
     // Init pins gsm
     // Инициализация обвязки GSM-модема A7682E
-    let _gsm_pwrkey = Output::new(p.PA8, Level::Low, Speed::Low);
-    let _gsm_reset = Output::new(p.PA11, Level::Low, Speed::Low);
-    let _gsm_dtr = Output::new(p.PC8, Level::Low, Speed::Low);
+    let gsm_pwrkey = Output::new(p.PA8, Level::Low, Speed::Low);
+    let gsm_reset = Output::new(p.PA11, Level::Low, Speed::Low);
+    let gsm_dtr = Output::new(p.PC8, Level::Low, Speed::Low);
     //
     // Входы. Транслятор TXS0108E подтягивает уровни сам, поэтому Pull::None
-    let _gsm_status = Input::new(p.PA12, Pull::None);
-    let _gsm_ring = Input::new(p.PC9, Pull::None);
+    let gsm_status = Input::new(p.PA12, Pull::None);
+    let gsm_ring = Input::new(p.PC9, Pull::None);
 
     info!("Станция катодной защиты: Система питания инициализирована!");
 
@@ -369,12 +568,23 @@ async fn main(spawner: Spawner) {
     pwm.ch3().set_duty_cycle(0);
     pwm.ch4().set_duty_cycle(0);
 
-    // Получаем потолок из любого канала
+    // Получаем аппаратный потолок
     let max_duty = pwm.ch1().max_duty_cycle();
-
-    //начальное значения для тока (модуля 1)
     let max_duty2 = pwm.ch2().max_duty_cycle();
-    pwm.ch2().set_duty_cycle((max_duty2 / 3) as u32);
+
+    // 1. Восстанавливаем ШИМ1 (Напряжение)
+    let pwm1_logical = crate::PWM1_ACTUAL.load(Ordering::Relaxed);
+    let pwm1_hw = ((pwm1_logical as u64 * max_duty as u64) / 1001) as u32;
+    pwm.ch1().set_duty_cycle(pwm1_hw);
+
+    // 2. Восстанавливаем ШИМ2 (Ток). Считаем, что его шкала 0..1000
+    let pwm2_logical = crate::PWM2_ACTUAL.load(Ordering::Relaxed);
+    let pwm2_hw = ((pwm2_logical as u64 * max_duty2 as u64) / 1000) as u32;
+    pwm.ch2().set_duty_cycle(pwm2_hw);
+
+    // Остальные каналы пока в ноль
+    pwm.ch3().set_duty_cycle(0);
+    pwm.ch4().set_duty_cycle(0);
 
     //----------------------------------------------------------------------------------
 
@@ -453,14 +663,14 @@ async fn main(spawner: Spawner) {
         .unwrap(),
     );
 
-    // Запускаем задачу GSM
-    // spawner.spawn(
-    //     gsm::gsm_task(
-    //         p.USART1, p.PA10, p.PA9, p.DMA2_CH2, p.DMA2_CH7, gsm_pwrkey, gsm_reset, gsm_dtr,
-    //         gsm_status, gsm_ring,
-    //     )
-    //     .unwrap(),
-    // );
+    //Запускаем задачу GSM
+    spawner.spawn(
+        gsm::gsm_task(
+            p.USART1, p.PA10, p.PA9, p.DMA2_CH2, p.DMA2_CH7, gsm_pwrkey, gsm_reset, gsm_dtr,
+            gsm_status, gsm_ring,
+        )
+        .unwrap(),
+    );
 
     loop {
         Timer::after_millis(5000).await;

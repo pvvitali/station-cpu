@@ -44,6 +44,22 @@ async fn dwin_write_int16<W: Write>(uart: &mut W, addr: u16, value: u16) {
     let _ = uart.write_all(&buf).await;
 }
 
+async fn dwin_write_int32<W: embedded_io_async::Write>(uart: &mut W, addr: u16, value: u32) {
+    let buf = [
+        0x5A,
+        0xA5,
+        0x07, // Длина оставшейся части пакета
+        0x82, // Команда записи
+        (addr >> 8) as u8,
+        (addr & 0xFF) as u8,
+        (value >> 24) as u8,
+        (value >> 16) as u8,
+        (value >> 8) as u8,
+        (value & 0xFF) as u8,
+    ];
+    let _ = uart.write_all(&buf).await;
+}
+
 #[embassy_executor::task]
 pub async fn dwin_task(
     usart6: Peri<'static, peripherals::USART6>,
@@ -91,7 +107,21 @@ pub async fn dwin_task(
                                                 let _ = crate::PWM_CHANNEL.try_send(data as u32);
                                             }
                                             0x5017 => info!("-> Аккумулятор: {}", data),
-                                            0x5030 => info!("-> SIM800: {}", data),
+                                            // Внутри rx_fut, где парсится адрес 0x5030
+                                            0x5030 => {
+                                                info!("-> GSM Переключатель (DWIN): {}", data);
+                                                crate::GSM_ON.store(data > 0, Ordering::Relaxed);
+                                                // При изменении настроек сразу запрашиваем сохранение
+                                                crate::SAVE_FLASH_REQUEST
+                                                    .store(true, Ordering::Relaxed);
+                                            }
+                                            //// Если добавишь 0x5014 для ШИМ2 (тока):
+                                            // 0x5014 => {
+                                            //     crate::PWM2_ACTUAL
+                                            //         .store(data as u32, Ordering::Relaxed);
+                                            //     crate::SAVE_FLASH_REQUEST
+                                            //         .store(true, Ordering::Relaxed);
+                                            // }
                                             _ => {}
                                         }
                                     }
@@ -155,7 +185,20 @@ pub async fn dwin_task(
             // Статичные переключатели (всегда включены на нашей плате)
             dwin_write_int16(&mut tx, 0x5017, 1).await; // Батарея (вкл)
             dwin_write_int16(&mut tx, 0x5022, 1).await; // Батарея (иконка)
-            dwin_write_int16(&mut tx, 0x5030, 1).await; // GSM переключатель (вкл)
+            //dwin_write_int16(&mut tx, 0x5030, 1).await; // GSM переключатель (вкл)
+
+            // Внутри tx_fut, добавь к остальным отправкам
+            let kwh = f32::from_bits(crate::ENERGY_KWH.load(Ordering::Relaxed));
+            let hours = crate::HOURS_WORK.load(Ordering::Relaxed);
+            let gsm_on_val: u16 = if crate::GSM_ON.load(Ordering::Relaxed) {
+                1
+            } else {
+                0
+            };
+
+            dwin_write_float(&mut tx, 0x5006, kwh).await; // Энергия[cite: 16]
+            dwin_write_int32(&mut tx, 0x5008, hours).await; // Часы наработки[cite: 16]
+            dwin_write_int16(&mut tx, 0x5030, gsm_on_val).await; // Состояние GSM[cite: 16]
 
             // Если для Bluetooth есть свой адрес в DGUS (например, 0x5032), добавь:
             // dwin_write_int16(&mut tx, 0x5032, 1).await;

@@ -158,10 +158,10 @@ fn parse_server_command(msg: &str) -> ServerCommand {
 macro_rules! send_server_ok {
     ($uart:expr, $rx_buf:expr, $cmd_id:expr, $tx_id:expr) => {{
         let mut payload = heapless::String::<64>::new();
-        core::fmt::write(&mut payload, format_args!("OK|{}|{}|", $cmd_id, $tx_id)).unwrap();
+        core::fmt::write(&mut payload, format_args!("#OK|{}|{}|", $cmd_id, $tx_id)).unwrap();
 
         let crc = crc_8(payload.as_bytes());
-        core::fmt::write(&mut payload, format_args!("{};\x1A", crc)).unwrap();
+        core::fmt::write(&mut payload, format_args!("{};", crc)).unwrap();
 
         let mut cmd = heapless::String::<32>::new();
         core::fmt::write(&mut cmd, format_args!("AT+CIPSEND=0,{}\r\n", payload.len())).unwrap();
@@ -171,7 +171,7 @@ macro_rules! send_server_ok {
             // Отправляем сам пакет
             if send_at!($uart, $rx_buf, payload.as_bytes(), "OK", 3000) {
                 info!(
-                    "GSM: Ответ серверу OK|{}|{}| успешно отправлен!",
+                    "GSM: Ответ серверу #OK|{}|{}|src; успешно отправлен!",
                     $cmd_id, $tx_id
                 );
             } else {
@@ -233,6 +233,10 @@ pub async fn gsm_task(
     .await;
 
     loop {
+        // --- СБРОС ФЛАГОВ ПРИ ПОТЕРИ СВЯЗИ И ПЕРЕЗАПУСКЕ ---
+        crate::GPRS_OK.store(false, core::sync::atomic::Ordering::Relaxed);
+        crate::GSM_OK.store(false, core::sync::atomic::Ordering::Relaxed);
+
         if send_at!(uart, rx_buf, b"AT\r\n", "OK", 1000) {
             break;
         }
@@ -242,6 +246,9 @@ pub async fn gsm_task(
     info!("GSM: Связь AT установлена.");
 
     loop {
+        // --- СБРОС ФЛАГОВ ПЕРЕД НОВОЙ ПОПЫТКОЙ РЕГИСТРАЦИИ ---
+        crate::GSM_OK.store(false, core::sync::atomic::Ordering::Relaxed);
+
         info!("GSM: Регистрация в сети и настройка...");
 
         loop {
@@ -295,6 +302,9 @@ pub async fn gsm_task(
         send_at!(uart, rx_buf, b"AT+CGDCONT=1,\"IP\",\"www\"\r\n", "OK", 2000);
         send_at!(uart, rx_buf, b"AT+CGACT=1,1\r\n", "OK", 5000);
 
+        // --- УСТАНОВКА ФЛАГА GPRS ПОСЛЕ УСПЕШНОЙ АКТИВАЦИИ APN ---
+        crate::GPRS_OK.store(true, core::sync::atomic::Ordering::Relaxed);
+
         // ПРИНУДИТЕЛЬНАЯ ОЧИСТКА: Закрываем старые соединения перед открытием новых
         info!("GSM: Очистка старых сессий...");
         let _ = send_at!(uart, rx_buf, b"AT+CIPCLOSE=0\r\n", "OK", 1500);
@@ -302,6 +312,29 @@ pub async fn gsm_task(
 
         let _ = send_at!(uart, rx_buf, b"AT+NETOPEN\r\n", "OK", 5000);
         Timer::after_secs(1).await;
+
+        // === НОВЫЙ БЛОК: Запрашиваем сигнал перед первой отправкой ===
+        let _ = uart.write_all(b"AT+CSQ\r\n").await;
+        if let Ok(Ok(len)) = with_timeout(
+            Duration::from_millis(500),
+            uart.read_until_idle(&mut rx_buf),
+        )
+        .await
+        {
+            if let Ok(resp) = str::from_utf8(&rx_buf[..len]) {
+                if let Some(csq_idx) = resp.find("+CSQ: ") {
+                    let tail = &resp[csq_idx + 6..];
+                    if let Some(comma_idx) = tail.find(',') {
+                        if let Ok(csq_val) = tail[..comma_idx].trim().parse::<u32>() {
+                            let valid_csq = if csq_val == 99 { 0 } else { csq_val };
+                            crate::GSM_SIGNAL
+                                .store(valid_csq, core::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+        }
+        // =============================================================
 
         info!("GSM: Подключение к TCP серверу scz.pge.md:16992...");
 
@@ -314,6 +347,9 @@ pub async fn gsm_task(
         ) {
             info!("GSM: Успешно подключено к серверу!");
 
+            // --- УСТАНОВКА ФЛАГА СЕРВЕРА ПРИ УСПЕШНОМ TCP-СОЕДИНЕНИИ ---
+            crate::GSM_OK.store(true, core::sync::atomic::Ordering::Relaxed);
+
             loop {
                 // Читаем реальные данные с датчиков
                 let u1_mv = crate::U1_ACTUAL_MV.load(core::sync::atomic::Ordering::Relaxed);
@@ -324,10 +360,12 @@ pub async fn gsm_task(
                 let csq = crate::GSM_SIGNAL.load(core::sync::atomic::Ordering::Relaxed);
 
                 let is_door_closed = crate::DOOR_CLOSED.load(core::sync::atomic::Ordering::Relaxed);
-                let is_220v_ok = if u1_mv > 10_000 { 1 } else { 0 }; // Условный флаг 220В
 
-                // В C-коде к напряжению и току прибавлялось 0.05 перед умножением (округление)
-                // Мы сделаем целочисленное деление, так как у нас уже милливольты
+                let is_on_battery = crate::POWER_SOURCE.load(core::sync::atomic::Ordering::Relaxed);
+                // Читаем аппаратный статус наличия 12В (POWER_SOURCE = false означает, что 12В есть)
+                let is_220v_ok = if !is_on_battery { "1" } else { "0" };
+
+                // Форматируем для сервера (напряжение и ток /100, потенциал /10)
                 let u_str = u1_mv / 100;
                 let i_str = i1_mv / 100;
                 let p_str = p1_mv / 10;
@@ -340,18 +378,18 @@ pub async fn gsm_task(
 
                 let door_str = if is_door_closed { "0" } else { "1" }; // 0-закрыто, 1-открыто
 
-                let mut payload = String::<256>::new();
+                let mut payload = heapless::String::<256>::new();
                 core::fmt::write(
                     &mut payload,
                     format_args!(
                         "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|",
-                        "10001005",    // ID станции
+                        "10000601",    // ID станции
                         i_str,         // i
                         u_str,         // u
                         p_str,         // p
                         bat_str,       // u_bat
                         csq,           // sq (сигнал)
-                        is_220v_ok,    // u220
+                        is_220v_ok,    //  СТАТУС 12В (220В)
                         door_str,      // door
                         temp_x10 / 10, // temperature (сервер ждет целые градусы)
                         energy_str,    // power (энергия * 10)
@@ -379,17 +417,28 @@ pub async fn gsm_task(
                         info!("GSM: Пакет успешно отправлен!");
                     } else {
                         error!("GSM: Ошибка передачи данных.");
+                        // --- ДОБАВИТЬ СБРОС ЗДЕСЬ ---
+                        crate::GSM_OK.store(false, core::sync::atomic::Ordering::Relaxed);
                         break;
                     }
                 } else {
                     error!("GSM: Сервер разорвал соединение или модем не готов.");
+                    crate::GSM_OK.store(false, core::sync::atomic::Ordering::Relaxed);
                     break;
                 }
 
                 info!("GSM: Ожидание 60 сек. Слушаем ответы сервера...");
 
                 let wait_start = embassy_time::Instant::now();
+                let mut last_csq_check = embassy_time::Instant::now();
+
                 while wait_start.elapsed().as_secs() < 60 {
+                    // --- ОПРОС АНТЕННЫ КАЖДЫЕ 5 СЕКУНД ---
+                    if last_csq_check.elapsed().as_secs() >= 5 {
+                        let _ = uart.write_all(b"AT+CSQ\r\n").await;
+                        last_csq_check = embassy_time::Instant::now();
+                    }
+
                     if let Ok(Ok(len)) = with_timeout(
                         Duration::from_millis(500),
                         uart.read_until_idle(&mut rx_buf),
@@ -399,38 +448,75 @@ pub async fn gsm_task(
                         if let Ok(resp) = str::from_utf8(&rx_buf[..len]) {
                             let text = resp.trim();
                             if !text.is_empty() {
-                                // Выводим сырые данные
-                                info!("GSM <- SERVER MSG: {}", text);
+                                // 1. Парсим ответ об уровне сигнала (+CSQ: 15,0)
+                                if let Some(csq_idx) = text.find("+CSQ: ") {
+                                    let tail = &text[csq_idx + 6..];
+                                    if let Some(comma_idx) = tail.find(',') {
+                                        if let Ok(csq_val) = tail[..comma_idx].trim().parse::<u32>()
+                                        {
+                                            // В SIM800 значение 99 означает "нет сигнала"
+                                            let valid_csq = if csq_val == 99 { 0 } else { csq_val };
+                                            crate::GSM_SIGNAL.store(
+                                                valid_csq,
+                                                core::sync::atomic::Ordering::Relaxed,
+                                            );
+                                        }
+                                    }
+                                }
 
-                                // Парсим команду
-                                let cmd = parse_server_command(text);
-                                match cmd {
-                                    ServerCommand::Heartbeat(tx_id) => {
-                                        info!(
-                                            "Получен Heartbeat (tx: {}). Отвечаем...",
-                                            tx_id.as_str()
-                                        );
-                                        send_server_ok!(uart, rx_buf, "1", tx_id.as_str());
-                                    }
-                                    ServerCommand::StepUp10V(tx_id) => {
-                                        // Вызываем .as_str()
-                                        info!("Получена команда +10V (tx: {})", tx_id.as_str());
-                                        // TODO: Отправить команду в доводчик напряжения
-                                    }
-                                    ServerCommand::PowerOff(tx_id) => {
-                                        // Вызываем .as_str()
-                                        info!(
-                                            "Получена команда Выкл. питания (tx: {})",
-                                            tx_id.as_str()
-                                        );
-                                        // TODO: Сбросить ШИМ в 0
-                                    }
-                                    ServerCommand::Unknown => {
-                                        // Игнорируем нераспознанные строки
-                                    }
-                                    _ => {
-                                        // Выводим саму структуру (теперь это работает благодаря defmt::Format)
-                                        info!("Получена команда: {:?}", cmd);
+                                // 2. Парсим команды от сервера (содержат $ или +IPD)
+                                if text.contains("+IPD") || text.contains('$') {
+                                    info!("GSM <- SERVER MSG: {}", text);
+                                    let cmd = parse_server_command(text);
+                                    match cmd {
+                                        ServerCommand::Heartbeat(tx_id) => {
+                                            info!(
+                                                "GSM: Запрос обновления данных (tx: {})",
+                                                tx_id.as_str()
+                                            );
+
+                                            // 1. Отвечаем серверу, что команда принята
+                                            send_server_ok!(uart, rx_buf, "1", tx_id.as_str());
+
+                                            // 2. Даем небольшую паузу, чтобы сервер успел переварить #OK
+                                            Timer::after_millis(100).await;
+
+                                            // 3. ПРЕРЫВАЕМ 60-СЕКУНДНОЕ ОЖИДАНИЕ!
+                                            // Программа выйдет из `while` и сразу начнет новый виток `loop`,
+                                            // соберет свежую телеметрию и отправит её.
+                                            break;
+                                        }
+                                        ServerCommand::StepUp10V(tx_id) => {
+                                            info!("GSM: Команда +10V (tx: {})", tx_id.as_str());
+                                            let _ = crate::ADJUST_CHANNEL
+                                                .try_send(crate::AdjustCmd::Up10V);
+                                            send_server_ok!(uart, rx_buf, "7", tx_id.as_str());
+                                        }
+                                        ServerCommand::StepDown10V(tx_id) => {
+                                            info!("GSM: Команда -10V (tx: {})", tx_id.as_str());
+                                            let _ = crate::ADJUST_CHANNEL
+                                                .try_send(crate::AdjustCmd::Down10V);
+                                            send_server_ok!(uart, rx_buf, "8", tx_id.as_str());
+                                        }
+                                        ServerCommand::StepUp1V(tx_id) => {
+                                            info!("GSM: Команда +1V (tx: {})", tx_id.as_str());
+                                            let _ = crate::ADJUST_CHANNEL
+                                                .try_send(crate::AdjustCmd::Up1V);
+                                            send_server_ok!(uart, rx_buf, "5", tx_id.as_str());
+                                        }
+                                        ServerCommand::StepDown1V(tx_id) => {
+                                            info!("GSM: Команда -1V (tx: {})", tx_id.as_str());
+                                            let _ = crate::ADJUST_CHANNEL
+                                                .try_send(crate::AdjustCmd::Down1V);
+                                            send_server_ok!(uart, rx_buf, "6", tx_id.as_str());
+                                        }
+                                        ServerCommand::Unknown => {}
+                                        _ => {
+                                            info!(
+                                                "Получена команда: {:?}",
+                                                defmt::Debug2Format(&cmd)
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -440,6 +526,7 @@ pub async fn gsm_task(
             }
         } else {
             error!("GSM: Ошибка подключения к TCP. Повтор через 10 сек...");
+            crate::GSM_OK.store(false, core::sync::atomic::Ordering::Relaxed);
         }
 
         send_at!(uart, rx_buf, b"AT+CIPCLOSE=0\r\n", "OK", 2000);

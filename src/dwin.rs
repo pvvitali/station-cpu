@@ -160,7 +160,14 @@ pub async fn dwin_task(
                 0
             };
             let csq = crate::GSM_SIGNAL.load(Ordering::Relaxed) as u16;
-            let gsm_status: u16 = if crate::GSM_OK.load(Ordering::Relaxed) {
+
+            // --- ОБНОВЛЕННЫЕ СТАТУСЫ ---
+            let gprs_status: u16 = if crate::GPRS_OK.load(Ordering::Relaxed) {
+                1
+            } else {
+                0
+            };
+            let server_status: u16 = if crate::GSM_OK.load(Ordering::Relaxed) {
                 1
             } else {
                 0
@@ -179,8 +186,8 @@ pub async fn dwin_task(
             dwin_write_int16(&mut tx, 0x5026, csq).await; // Антенна GSM (уровень)
 
             // Статусы GSM
-            dwin_write_int16(&mut tx, 0x5020, gsm_status).await; // GSM OK
-            dwin_write_int16(&mut tx, 0x5021, gsm_status).await; // Server OK
+            dwin_write_int16(&mut tx, 0x5020, gprs_status).await; // Иконка СИМ-карты / GPRS
+            dwin_write_int16(&mut tx, 0x5021, server_status).await; // Иконка Сервера
 
             // Статичные переключатели (всегда включены на нашей плате)
             dwin_write_int16(&mut tx, 0x5017, 1).await; // Батарея (вкл)

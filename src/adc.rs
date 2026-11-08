@@ -185,14 +185,18 @@ pub async fn sensors_task(
         // Если логика инвертирована, поменяй на !current_door_state
         crate::DOOR_CLOSED.store(current_door_state, Ordering::Relaxed);
 
+        // Считываем сырое значение CSQ (0..31)
+        let csq_raw = crate::GSM_SIGNAL.load(Ordering::Relaxed) as u8;
+
         let telemetry_data = crate::display::Telemetry {
             mod1_v: voltage_m1,
             mod1_i: i1_filtered,
             mod2_v: voltage_m2,
             mod2_i: i2_filtered,
             p: voltage_p,
-            is_door_open: current_door_state,
-            gsm_signal_percent: 85,
+            is_door_open: !current_door_state,
+            // Передаем сырое значение (имя поля оставим gsm_signal_percent, чтобы не менять много кода)
+            gsm_signal_percent: csq_raw,
             diag_msg: diag_buf,
         };
 

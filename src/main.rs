@@ -61,6 +61,7 @@ pub static BAT_VOLTAGE_MV: AtomicU32 = AtomicU32::new(0);
 pub static TEMP_C_X10: AtomicI32 = AtomicI32::new(0); // Градусы * 10
 pub static GSM_SIGNAL: AtomicU32 = AtomicU32::new(0); // Сигнал CSQ
 pub static GSM_OK: AtomicBool = AtomicBool::new(false); // Статус подключения
+pub static GPRS_OK: AtomicBool = AtomicBool::new(false);
 
 // PWM atomic
 use core::sync::atomic::AtomicU32;
@@ -72,6 +73,24 @@ pub static PWM1_ACTUAL: AtomicU32 = AtomicU32::new(0);
 //
 // Канал команд. Сюда DWIN и GSM будут кидать новые целевые значения (0..1001).
 pub static PWM_CHANNEL: Channel<ThreadModeRawMutex, u32, 4> = Channel::new();
+
+// ------------------------------------------------
+
+// --- ДОБАВЛЕННЫЙ КОД ДЛЯ ДОВОДЧИКА НАПРЯЖЕНИЯ ---
+#[derive(Clone, Copy)]
+pub enum AdjustCmd {
+    Up1V,
+    Down1V,
+    Up10V,
+    Down10V,
+    Up0_1V,
+    Down0_1V,
+}
+
+// Канал команд для асинхронного доводчика напряжения
+pub static ADJUST_CHANNEL: Channel<ThreadModeRawMutex, AdjustCmd, 4> = Channel::new();
+
+// ------------------------------------------------
 
 // --- Новые глобальные переменные ----------------------------------------------------------
 // Энергия (кВт*ч). Храним f32 в виде u32 битов.

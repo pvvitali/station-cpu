@@ -190,6 +190,9 @@ async fn monitor_power_good(mut pg: ExtiInput<'static, Async>, mut otg: Output<'
                 is_battery_mode = false;
                 info!("[ПИТАНИЕ] Внешнее напряжение 12В восстановлено! (PG = 0)");
 
+                // --- СИГНАЛ НА СРОЧНУЮ ОТПРАВКУ ---
+                crate::FORCE_TELEMETRY_UPDATE.store(true, Ordering::Relaxed);
+
                 Timer::after_millis(350).await; // Даем 12В зарядить конденсаторы
                 POWER_STABLE.store(true, Ordering::Relaxed); // Снимаем АЦП с паузы
             } else {
@@ -209,6 +212,9 @@ async fn monitor_power_good(mut pg: ExtiInput<'static, Async>, mut otg: Output<'
                 POWER_SOURCE.store(true, Ordering::Relaxed);
                 is_battery_mode = true;
                 warn!("[ПИТАНИЕ] Отключение 12В! Переход на резервную АКБ! (PG = 1)");
+
+                // --- СИГНАЛ НА СРОЧНУЮ ОТПРАВКУ ---
+                crate::FORCE_TELEMETRY_UPDATE.store(true, Ordering::Relaxed);
 
                 Timer::after_millis(20).await; // Ждем стабилизации 5В
                 POWER_STABLE.store(true, Ordering::Relaxed); // Снимаем с паузы

@@ -249,6 +249,40 @@ pub async fn gsm_task(
         // --- СБРОС ФЛАГОВ ПЕРЕД НОВОЙ ПОПЫТКОЙ РЕГИСТРАЦИИ ---
         crate::GSM_OK.store(false, core::sync::atomic::Ordering::Relaxed);
 
+        // ========================================================
+        // --- ОБРАБОТКА ВЫКЛЮЧЕННОГО СОСТОЯНИЯ ---
+        if !crate::GSM_ON.load(core::sync::atomic::Ordering::Relaxed) {
+            info!("GSM: Работа остановлена. Выключаем модем...");
+
+            // Пробуем выключить программно
+            let _ = uart.write_all(b"AT+CPOWD=1\r\n").await;
+            Timer::after_secs(3).await;
+
+            // Если пин STATUS все еще высокий - глушим аппаратно через PWRKEY
+            if status.is_high() {
+                pwrkey.set_high();
+                Timer::after_millis(2500).await; // Для A7682E удержание > 2.5 сек выключает модуль
+                pwrkey.set_low();
+            }
+
+            // --- БЕСКОНЕЧНЫЙ СОН, ПОКА НЕ ВКЛЮЧАТ ---
+            while !crate::GSM_ON.load(core::sync::atomic::Ordering::Relaxed) {
+                Timer::after_secs(1).await;
+            }
+
+            info!("GSM: Включение модема с экрана...");
+            // Запускаем аппаратно
+            if status.is_low() {
+                pwrkey.set_high();
+                Timer::after_millis(1000).await;
+                pwrkey.set_low();
+                Timer::after_secs(3).await;
+            }
+            // Пропускаем текущий виток цикла, чтобы переинициализировать AT-команды
+            continue;
+        }
+        // ========================================================
+
         info!("GSM: Регистрация в сети и настройка...");
 
         loop {
@@ -314,28 +348,39 @@ pub async fn gsm_task(
         Timer::after_secs(1).await;
 
         // === НОВЫЙ БЛОК: Запрашиваем сигнал перед первой отправкой ===
-        let _ = uart.write_all(b"AT+CSQ\r\n").await;
-        if let Ok(Ok(len)) = with_timeout(
-            Duration::from_millis(500),
-            uart.read_until_idle(&mut rx_buf),
-        )
-        .await
-        {
-            if let Ok(resp) = str::from_utf8(&rx_buf[..len]) {
-                if let Some(csq_idx) = resp.find("+CSQ: ") {
-                    let tail = &resp[csq_idx + 6..];
-                    if let Some(comma_idx) = tail.find(',') {
-                        if let Ok(csq_val) = tail[..comma_idx].trim().parse::<u32>() {
-                            let valid_csq = if csq_val == 99 { 0 } else { csq_val };
-                            crate::GSM_SIGNAL
-                                .store(valid_csq, core::sync::atomic::Ordering::Relaxed);
+        info!("GSM: Ожидание стабилизации уровня сигнала (CSQ)...");
+        let mut csq_attempts = 0;
+
+        while csq_attempts < 10 {
+            let _ = uart.write_all(b"AT+CSQ\r\n").await;
+            if let Ok(Ok(len)) = with_timeout(
+                Duration::from_millis(500),
+                uart.read_until_idle(&mut rx_buf),
+            )
+            .await
+            {
+                if let Ok(resp) = str::from_utf8(&rx_buf[..len]) {
+                    if let Some(csq_idx) = resp.find("+CSQ: ") {
+                        let tail = &resp[csq_idx + 6..];
+                        if let Some(comma_idx) = tail.find(',') {
+                            if let Ok(csq_val) = tail[..comma_idx].trim().parse::<u32>() {
+                                // Если сигнал не 99 (известен) или мы уже слишком долго ждем
+                                if csq_val != 99 || csq_attempts == 9 {
+                                    let valid_csq = if csq_val == 99 { 0 } else { csq_val };
+                                    crate::GSM_SIGNAL
+                                        .store(valid_csq, core::sync::atomic::Ordering::Relaxed);
+                                    info!("GSM: Сигнал получен: {}", valid_csq);
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
             }
+            csq_attempts += 1;
+            Timer::after_millis(500).await; // Ждем полсекунды перед следующей попыткой
         }
         // =============================================================
-
         info!("GSM: Подключение к TCP серверу scz.pge.md:16992...");
 
         if send_at!(
@@ -350,7 +395,7 @@ pub async fn gsm_task(
             // --- УСТАНОВКА ФЛАГА СЕРВЕРА ПРИ УСПЕШНОМ TCP-СОЕДИНЕНИИ ---
             crate::GSM_OK.store(true, core::sync::atomic::Ordering::Relaxed);
 
-            loop {
+            'telemetry_loop: loop {
                 // Читаем реальные данные с датчиков
                 let u1_mv = crate::U1_ACTUAL_MV.load(core::sync::atomic::Ordering::Relaxed);
                 let i1_mv = crate::I1_ACTUAL_MV.load(core::sync::atomic::Ordering::Relaxed);
@@ -473,6 +518,12 @@ pub async fn gsm_task(
 
                 // Спим заданное количество секунд
                 while wait_start.elapsed().as_secs() < current_period {
+                    // --- ПРОВЕРКА ВЫКЛЮЧЕНИЯ В РЕАЛЬНОМ ВРЕМЕНИ ---
+                    if !crate::GSM_ON.load(core::sync::atomic::Ordering::Relaxed) {
+                        info!("GSM: Выключен с экрана! Разрыв связи...");
+                        break 'telemetry_loop; // ИСПРАВЛЕНИЕ: Выходим из внешнего цикла телеметрии
+                    }
+
                     // --- ПРОВЕРЯЕМ СИГНАЛ ОТ ДОВОДЧИКА ---
                     if crate::FORCE_TELEMETRY_UPDATE.load(core::sync::atomic::Ordering::Relaxed) {
                         crate::FORCE_TELEMETRY_UPDATE

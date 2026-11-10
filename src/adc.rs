@@ -100,6 +100,9 @@ pub async fn sensors_task(
     let mut i1_filtered: f32 = 0.0;
     let mut i2_filtered: f32 = 0.0;
 
+    //
+    let mut last_door_state = crate::DOOR_CLOSED.load(core::sync::atomic::Ordering::Relaxed);
+
     loop {
         // 1. Если питание нестабильно, просто ждем 100 мс и пропускаем цикл измерений
         if !crate::POWER_STABLE.load(core::sync::atomic::Ordering::Relaxed) {
@@ -124,6 +127,16 @@ pub async fn sensors_task(
         }
 
         let current_door_state = pin_door.is_low();
+
+        // Обновляем глобальную переменную (для экранов)
+        crate::DOOR_CLOSED.store(current_door_state, core::sync::atomic::Ordering::Relaxed);
+
+        // Если состояние изменилось по сравнению с прошлым разом — бьем тревогу!
+        if current_door_state != last_door_state {
+            //info!("Дверь изменила состояние! Срочная отправка телеметрии...");
+            crate::FORCE_TELEMETRY_UPDATE.store(true, core::sync::atomic::Ordering::Relaxed);
+            last_door_state = current_door_state;
+        }
 
         let voltage_p = raw_to_volts(raw_p);
 

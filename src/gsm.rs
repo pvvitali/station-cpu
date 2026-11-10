@@ -81,7 +81,7 @@ pub enum ServerCommand {
     StepDown10V(heapless::String<10>), // $8
     SetAuto {
         tx_id: heapless::String<10>,
-        target_u_mv: u32,
+        target_u_mv: i32,
     }, // $9|tx_id|target|
     DisableAuto(heapless::String<10>), // $10
     PowerOn(heapless::String<10>),   // $11
@@ -135,10 +135,10 @@ fn parse_server_command(msg: &str) -> ServerCommand {
         "7" => ServerCommand::StepUp10V(tx_id),
         "8" => ServerCommand::StepDown10V(tx_id),
         "9" if parts.len() >= 3 => {
-            if let Ok(target) = parts[2].parse::<u32>() {
+            if let Ok(target) = parts[2].parse::<i32>() {
                 ServerCommand::SetAuto {
                     tx_id,
-                    target_u_mv: target,
+                    target_u_mv: target * 10, // Переводим -125 (сотые) в -1250 мВ!
                 }
             } else {
                 ServerCommand::Unknown
@@ -158,7 +158,7 @@ fn parse_server_command(msg: &str) -> ServerCommand {
 macro_rules! send_server_ok {
     ($uart:expr, $rx_buf:expr, $cmd_id:expr, $tx_id:expr) => {{
         let mut payload = heapless::String::<64>::new();
-        core::fmt::write(&mut payload, format_args!("#OK|{}|{}|", $cmd_id, $tx_id)).unwrap();
+        core::fmt::write(&mut payload, format_args!("OK|{}|{}|", $cmd_id, $tx_id)).unwrap();
 
         let crc = crc_8(payload.as_bytes());
         core::fmt::write(&mut payload, format_args!("{};", crc)).unwrap();
@@ -171,7 +171,7 @@ macro_rules! send_server_ok {
             // Отправляем сам пакет
             if send_at!($uart, $rx_buf, payload.as_bytes(), "OK", 3000) {
                 info!(
-                    "GSM: Ответ серверу #OK|{}|{}|src; успешно отправлен!",
+                    "GSM: Ответ серверу OK|{}|{}|src; успешно отправлен!",
                     $cmd_id, $tx_id
                 );
             } else {
@@ -357,47 +357,79 @@ pub async fn gsm_task(
                 let p1_mv = crate::P1_ACTUAL_MV.load(core::sync::atomic::Ordering::Relaxed);
                 let bat_mv = crate::BAT_VOLTAGE_MV.load(core::sync::atomic::Ordering::Relaxed);
                 let temp_x10 = crate::TEMP_C_X10.load(core::sync::atomic::Ordering::Relaxed);
-                let csq = crate::GSM_SIGNAL.load(core::sync::atomic::Ordering::Relaxed);
+                let csq_raw = crate::GSM_SIGNAL.load(core::sync::atomic::Ordering::Relaxed);
 
-                let is_door_closed = crate::DOOR_CLOSED.load(core::sync::atomic::Ordering::Relaxed);
+                // 0 - HardwareId
+                let id_str = "10000601";
 
-                let is_on_battery = crate::POWER_SOURCE.load(core::sync::atomic::Ordering::Relaxed);
-                // Читаем аппаратный статус наличия 12В (POWER_SOURCE = false означает, что 12В есть)
-                let is_220v_ok = if !is_on_battery { "1" } else { "0" };
-
-                // Форматируем для сервера (напряжение и ток /100, потенциал /10)
-                let u_str = u1_mv / 100;
+                // 1 - Выходной ток * 10 (мА / 100) -> 30.2A = 302
                 let i_str = i1_mv / 100;
+
+                // 2 - Выходное напряжение * 10 (мВ / 100) -> -21.5V = -215
+                let u_str = u1_mv / 100;
+
+                // 3 - Защитный потенциал * 100 (мВ / 10) -> 8.3V = 830
                 let p_str = p1_mv / 10;
+
+                // 4 - Напряжение батареи * 10 (мВ / 100) -> 4.2V = 42
                 let bat_str = bat_mv / 100;
 
-                // Энергия в кВт*ч (нужно умножить на 10 для формата сервера)
-                let energy_kwh =
-                    f32::from_bits(crate::ENERGY_KWH.load(core::sync::atomic::Ordering::Relaxed));
-                let energy_str = (energy_kwh * 10.0) as u32;
+                // сырые 0..31
+                let gsm_percent = csq_raw;
 
-                let door_str = if is_door_closed { "0" } else { "1" }; // 0-закрыто, 1-открыто
+                // 6 - Наличие 220V (1 - есть, 0 - нет)
+                let is_on_battery = crate::POWER_SOURCE.load(core::sync::atomic::Ordering::Relaxed);
+                let is_220v_ok = if !is_on_battery { "1" } else { "0" };
+
+                // 7 - Дверь (0 - закрыта, 1 - открыта)
+                let is_door_closed = crate::DOOR_CLOSED.load(core::sync::atomic::Ordering::Relaxed);
+                let door_str = if is_door_closed { "0" } else { "1" };
+
+                // 8 - Температура (целые градусы)
+                let temp_c = temp_x10 / 10;
+
+                // 9 - Энергия кВт*ч (целое число [int], без умножения на 10)
+                let energy_kwh =
+                    f32::from_bits(crate::ENERGY_KWH.load(core::sync::atomic::Ordering::Relaxed))
+                        as u32;
+
+                // 10, 11 - Аварии по току и температуре (0 - ок)
+                let alarm_i = "0";
+                let alarm_t = "0";
+
+                // 12 - Интервал передачи (сервер ждет в десятках секунд)
+                let period_secs =
+                    crate::TELEMETRY_PERIOD_SECS.load(core::sync::atomic::Ordering::Relaxed);
+                let period_for_server = period_secs / 10;
+
+                // 13 - Авто режим (0/1)
+                let is_auto = crate::AUTO_MODE.load(core::sync::atomic::Ordering::Relaxed);
+                let auto_mode = if is_auto { "1" } else { "0" };
+
+                // 14 - Целевой потенциал (делим на 10, чтобы из -1250 мВ получить -125 для сервера)
+                let target_mv = crate::AUTO_TARGET_MV.load(core::sync::atomic::Ordering::Relaxed);
+                let auto_value = target_mv / 10;
 
                 let mut payload = heapless::String::<256>::new();
                 core::fmt::write(
                     &mut payload,
                     format_args!(
                         "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|",
-                        "10000601",    // ID станции
-                        i_str,         // i
-                        u_str,         // u
-                        p_str,         // p
-                        bat_str,       // u_bat
-                        csq,           // sq (сигнал)
-                        is_220v_ok,    //  СТАТУС 12В (220В)
-                        door_str,      // door
-                        temp_x10 / 10, // temperature (сервер ждет целые градусы)
-                        energy_str,    // power (энергия * 10)
-                        "0",           // i_max
-                        "0",           // t_max
-                        "6",           // period_transfer (в десятках секунд, 6 = 60 сек)
-                        "0",           // auto_on_off
-                        "0"            // auto_value
+                        id_str,            // 0
+                        i_str,             // 1
+                        u_str,             // 2
+                        p_str,             // 3
+                        bat_str,           // 4
+                        gsm_percent,       // 5
+                        is_220v_ok,        // 6
+                        door_str,          // 7
+                        temp_c,            // 8
+                        energy_kwh,        // 9
+                        alarm_i,           // 10
+                        alarm_t,           // 11
+                        period_for_server, // 12
+                        auto_mode,         // 13
+                        auto_value         // 14
                     ),
                 )
                 .unwrap();
@@ -432,7 +464,23 @@ pub async fn gsm_task(
                 let wait_start = embassy_time::Instant::now();
                 let mut last_csq_check = embassy_time::Instant::now();
 
-                while wait_start.elapsed().as_secs() < 60 {
+                let mut current_period =
+                    crate::TELEMETRY_PERIOD_SECS.load(core::sync::atomic::Ordering::Relaxed) as u64;
+                // Защита от "DDOS-атаки": если сервер пришлет слишком маленький интервал, ограничиваем минимум 10 секундами
+                if current_period < 10 {
+                    current_period = 10;
+                }
+
+                // Спим заданное количество секунд
+                while wait_start.elapsed().as_secs() < current_period {
+                    // --- ПРОВЕРЯЕМ СИГНАЛ ОТ ДОВОДЧИКА ---
+                    if crate::FORCE_TELEMETRY_UPDATE.load(core::sync::atomic::Ordering::Relaxed) {
+                        crate::FORCE_TELEMETRY_UPDATE
+                            .store(false, core::sync::atomic::Ordering::Relaxed);
+                        info!("GSM: Доводчик завершил работу. Внеочередная отправка телеметрии!");
+                        break; // Выходим из ожидания, сразу начнется новый виток с отправкой данных!
+                    }
+
                     // --- ОПРОС АНТЕННЫ КАЖДЫЕ 5 СЕКУНД ---
                     if last_csq_check.elapsed().as_secs() >= 5 {
                         let _ = uart.write_all(b"AT+CSQ\r\n").await;
@@ -488,27 +536,167 @@ pub async fn gsm_task(
                                         }
                                         ServerCommand::StepUp10V(tx_id) => {
                                             info!("GSM: Команда +10V (tx: {})", tx_id.as_str());
+                                            crate::AUTO_MODE.store(
+                                                false,
+                                                core::sync::atomic::Ordering::Relaxed,
+                                            );
                                             let _ = crate::ADJUST_CHANNEL
                                                 .try_send(crate::AdjustCmd::Up10V);
                                             send_server_ok!(uart, rx_buf, "7", tx_id.as_str());
                                         }
                                         ServerCommand::StepDown10V(tx_id) => {
                                             info!("GSM: Команда -10V (tx: {})", tx_id.as_str());
+                                            crate::AUTO_MODE.store(
+                                                false,
+                                                core::sync::atomic::Ordering::Relaxed,
+                                            );
                                             let _ = crate::ADJUST_CHANNEL
                                                 .try_send(crate::AdjustCmd::Down10V);
                                             send_server_ok!(uart, rx_buf, "8", tx_id.as_str());
                                         }
                                         ServerCommand::StepUp1V(tx_id) => {
                                             info!("GSM: Команда +1V (tx: {})", tx_id.as_str());
+                                            crate::AUTO_MODE.store(
+                                                false,
+                                                core::sync::atomic::Ordering::Relaxed,
+                                            );
                                             let _ = crate::ADJUST_CHANNEL
                                                 .try_send(crate::AdjustCmd::Up1V);
                                             send_server_ok!(uart, rx_buf, "5", tx_id.as_str());
                                         }
                                         ServerCommand::StepDown1V(tx_id) => {
                                             info!("GSM: Команда -1V (tx: {})", tx_id.as_str());
+                                            crate::AUTO_MODE.store(
+                                                false,
+                                                core::sync::atomic::Ordering::Relaxed,
+                                            );
                                             let _ = crate::ADJUST_CHANNEL
                                                 .try_send(crate::AdjustCmd::Down1V);
                                             send_server_ok!(uart, rx_buf, "6", tx_id.as_str());
+                                        }
+                                        ServerCommand::StepUp0_1V(tx_id) => {
+                                            info!("GSM: Команда +0.1V (tx: {})", tx_id.as_str());
+                                            crate::AUTO_MODE.store(
+                                                false,
+                                                core::sync::atomic::Ordering::Relaxed,
+                                            );
+                                            let _ = crate::ADJUST_CHANNEL
+                                                .try_send(crate::AdjustCmd::Up0_1V);
+                                            send_server_ok!(uart, rx_buf, "13", tx_id.as_str());
+                                        }
+                                        ServerCommand::StepDown0_1V(tx_id) => {
+                                            info!("GSM: Команда -0.1V (tx: {})", tx_id.as_str());
+                                            crate::AUTO_MODE.store(
+                                                false,
+                                                core::sync::atomic::Ordering::Relaxed,
+                                            );
+                                            let _ = crate::ADJUST_CHANNEL
+                                                .try_send(crate::AdjustCmd::Down0_1V);
+                                            send_server_ok!(uart, rx_buf, "14", tx_id.as_str());
+                                        }
+                                        ServerCommand::PowerOff(tx_id) => {
+                                            info!("GSM: Команда Выкл. (tx: {})", tx_id.as_str());
+                                            crate::AUTO_MODE.store(
+                                                false,
+                                                core::sync::atomic::Ordering::Relaxed,
+                                            );
+
+                                            // Шлем 0 и приклеиваем бит 31 (1 << 31), чтобы пропустить запись
+                                            let _ = crate::PWM_CHANNEL.try_send(0 | (1 << 31));
+                                            send_server_ok!(uart, rx_buf, "12", tx_id.as_str());
+
+                                            // Даем конденсаторам 500 мс на разряд и высылаем свежую телеметрию
+                                            Timer::after_millis(500).await;
+                                            crate::FORCE_TELEMETRY_UPDATE
+                                                .store(true, core::sync::atomic::Ordering::Relaxed);
+                                        }
+                                        ServerCommand::PowerOn(tx_id) => {
+                                            info!("GSM: Команда Вкл. (tx: {})", tx_id.as_str());
+                                            crate::AUTO_MODE.store(
+                                                false,
+                                                core::sync::atomic::Ordering::Relaxed,
+                                            );
+
+                                            // Читаем сохраненное значение напрямую из сектора флеш-памяти
+                                            let flash_addr: u32 = 0x080E_0000;
+                                            let saved_config = unsafe {
+                                                &*(flash_addr as *const crate::SavedConfig)
+                                            };
+                                            let restore_pwm = if saved_config.magic == 0xAA55AA55 {
+                                                saved_config.pwm1_logical
+                                            } else {
+                                                0
+                                            };
+
+                                            // Восстанавливаем ШИМ, приклеиваем бит 31 (в памяти и так уже лежит это число, не затираем ресурс флешки)
+                                            let _ = crate::PWM_CHANNEL
+                                                .try_send(restore_pwm | (1 << 31));
+                                            send_server_ok!(uart, rx_buf, "11", tx_id.as_str());
+
+                                            // Ждем стабилизации напряжения и высылаем телеметрию
+                                            Timer::after_millis(500).await;
+                                            crate::FORCE_TELEMETRY_UPDATE
+                                                .store(true, core::sync::atomic::Ordering::Relaxed);
+                                        }
+                                        ServerCommand::SetPeriod { tx_id, period_ms } => {
+                                            info!(
+                                                "GSM: Изменение интервала передачи (tx: {}, period: {} сек)",
+                                                tx_id.as_str(),
+                                                period_ms * 10
+                                            );
+
+                                            // 1. Сохраняем новый интервал
+                                            crate::TELEMETRY_PERIOD_SECS.store(
+                                                period_ms * 10,
+                                                core::sync::atomic::Ordering::Relaxed,
+                                            );
+
+                                            // --- ДОБАВЛЯЕМ ЗАПРОС НА СОХРАНЕНИЕ ---
+                                            crate::SAVE_FLASH_REQUEST
+                                                .store(true, core::sync::atomic::Ordering::Relaxed);
+
+                                            // 2. Отвечаем серверу
+                                            send_server_ok!(uart, rx_buf, "3", tx_id.as_str());
+                                            Timer::after_millis(200).await;
+
+                                            // 3. Прерываем текущее ожидание, чтобы станция сразу отправила
+                                            // свежий пакет, в котором 12-е поле уже будет содержать новый интервал.
+                                            break;
+                                        }
+                                        ServerCommand::SetAuto { tx_id, target_u_mv } => {
+                                            info!(
+                                                "GSM: Включен АВТО режим. Цель: {} мВ (tx: {})",
+                                                target_u_mv,
+                                                tx_id.as_str()
+                                            );
+                                            crate::AUTO_TARGET_MV.store(
+                                                target_u_mv,
+                                                core::sync::atomic::Ordering::Relaxed,
+                                            );
+                                            crate::AUTO_MODE
+                                                .store(true, core::sync::atomic::Ordering::Relaxed);
+                                            crate::SAVE_FLASH_REQUEST
+                                                .store(true, core::sync::atomic::Ordering::Relaxed);
+
+                                            send_server_ok!(uart, rx_buf, "9", tx_id.as_str());
+                                            Timer::after_millis(200).await;
+                                            break;
+                                        }
+                                        ServerCommand::DisableAuto(tx_id) => {
+                                            info!(
+                                                "GSM: Отключен АВТО режим (tx: {})",
+                                                tx_id.as_str()
+                                            );
+                                            crate::AUTO_MODE.store(
+                                                false,
+                                                core::sync::atomic::Ordering::Relaxed,
+                                            );
+                                            crate::SAVE_FLASH_REQUEST
+                                                .store(true, core::sync::atomic::Ordering::Relaxed);
+
+                                            send_server_ok!(uart, rx_buf, "10", tx_id.as_str());
+                                            Timer::after_millis(200).await;
+                                            break;
                                         }
                                         ServerCommand::Unknown => {}
                                         _ => {

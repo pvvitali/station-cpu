@@ -74,6 +74,16 @@ pub static PWM1_ACTUAL: AtomicU32 = AtomicU32::new(0);
 // Канал команд. Сюда DWIN и GSM будут кидать новые целевые значения (0..1001).
 pub static PWM_CHANNEL: Channel<ThreadModeRawMutex, u32, 4> = Channel::new();
 
+// Флаг принудительной отправки телеметрии (когда доводчик закончил работу)
+pub static FORCE_TELEMETRY_UPDATE: AtomicBool = AtomicBool::new(false);
+
+// Динамический интервал отправки телеметрии (в секундах)
+pub static TELEMETRY_PERIOD_SECS: AtomicU32 = AtomicU32::new(60);
+
+// --- АВТОМАТИЧЕСКИЙ РЕЖИМ ---
+pub static AUTO_MODE: AtomicBool = AtomicBool::new(false);
+pub static AUTO_TARGET_MV: AtomicI32 = AtomicI32::new(0);
+
 // ------------------------------------------------
 
 // --- ДОБАВЛЕННЫЙ КОД ДЛЯ ДОВОДЧИКА НАПРЯЖЕНИЯ ---
@@ -119,7 +129,10 @@ pub struct SavedConfig {
     pub hours_work: u32,
     pub pwm1_logical: u32,
     pub pwm2_logical: u32,
-    pub gsm_on: u32, // 1 или 0
+    pub gsm_on: u32,
+    pub telemetry_period: u32,
+    pub auto_mode: u32,      // <-- ДОБАВЛЕНО (1 или 0)
+    pub auto_target_mv: i32, // <-- ДОБАВЛЕНО
 }
 
 const MAGIC_WORD: u32 = 0xAA55AA55;
@@ -362,10 +375,17 @@ pub async fn flash_manager_task() {
                 } else {
                     0
                 },
+                telemetry_period: crate::TELEMETRY_PERIOD_SECS.load(Ordering::Relaxed),
+                auto_mode: if crate::AUTO_MODE.load(Ordering::Relaxed) {
+                    1
+                } else {
+                    0
+                },
+                auto_target_mv: crate::AUTO_TARGET_MV.load(Ordering::Relaxed),
             };
 
-            // Готовим выровненный буфер (32 байта = 8 слов u32)
-            let mut write_buf = [0xFFFF_FFFFu32; 8];
+            // Готовим выровненный буфер (10 слов u32)
+            let mut write_buf = [0xFFFF_FFFFu32; 10];
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     &config as *const _ as *const u8,
@@ -413,7 +433,7 @@ pub async fn flash_manager_task() {
                 core::ptr::write_volatile(flash_cr, cr);
 
                 let flash_ptr = flash_addr as *mut u32;
-                for i in 0..8 {
+                for i in 0..10 {
                     core::ptr::write_volatile(flash_ptr.add(i), write_buf[i]);
                     // Ждем завершения записи слова
                     while (core::ptr::read_volatile(flash_sr) & (1 << 16)) != 0 {}
@@ -491,6 +511,20 @@ async fn main(spawner: Spawner) {
         crate::PWM1_ACTUAL.store(saved_config.pwm1_logical, Ordering::Relaxed);
         crate::PWM2_ACTUAL.store(saved_config.pwm2_logical, Ordering::Relaxed);
         crate::GSM_ON.store(saved_config.gsm_on == 1, Ordering::Relaxed);
+
+        // --- ДОБАВЛЕНО: проверяем, чтобы там не было мусора ---
+        let mut t_period = saved_config.telemetry_period;
+        if t_period < 10 || t_period > 3600 {
+            t_period = 60;
+        } // Защита от битых данных
+        crate::TELEMETRY_PERIOD_SECS.store(t_period, Ordering::Relaxed);
+
+        crate::AUTO_MODE.store(saved_config.auto_mode == 1, Ordering::Relaxed);
+        // Защита от бредовых значений из пустой флешки
+        let t_mv = saved_config.auto_target_mv;
+        if t_mv > -5000 && t_mv < 5000 {
+            crate::AUTO_TARGET_MV.store(t_mv, Ordering::Relaxed);
+        }
     } else {
         info!("Флеш-память пуста или повреждена. Применяем настройки по умолчанию.");
         // Значения по умолчанию уже заданы при объявлении (PWM1=0, PWM2=333, GSM=true, etc.)
@@ -615,6 +649,9 @@ async fn main(spawner: Spawner) {
     //
     spawner.spawn(encoder::encoder_task(qei, enc_btn, pwm, max_duty).unwrap());
 
+    // регулировка напряжения
+    spawner.spawn(encoder::voltage_adjuster_task().unwrap());
+
     // =========================================================
     // Запуск независимых задач
     // =========================================================
@@ -690,6 +727,8 @@ async fn main(spawner: Spawner) {
         )
         .unwrap(),
     );
+
+    spawner.spawn(encoder::auto_regulation_task().unwrap());
 
     loop {
         Timer::after_millis(5000).await;

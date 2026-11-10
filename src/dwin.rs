@@ -103,6 +103,18 @@ pub async fn dwin_task(
                                         match addr {
                                             0x5012 => {
                                                 info!("-> Изменение ШИМ: {}", data);
+
+                                                // --- ОТКЛЮЧАЕМ АВТО-РЕЖИМ ПРИ РУЧНОМ УПРАВЛЕНИИ С ЭКРАНА ---
+                                                if crate::AUTO_MODE.load(Ordering::Relaxed) {
+                                                    crate::AUTO_MODE
+                                                        .store(false, Ordering::Relaxed);
+                                                    info!(
+                                                        "Ручное вмешательство (DWIN): Авто-режим отключен!"
+                                                    );
+                                                    // Сохранение во флеш-память автоматически подхватится
+                                                    // через 10-секундный таймер в задаче энкодера.
+                                                }
+
                                                 // Отправляем значение от экрана в канал управления ШИМ
                                                 let _ = crate::PWM_CHANNEL.try_send(data as u32);
                                             }

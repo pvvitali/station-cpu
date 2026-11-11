@@ -28,6 +28,11 @@ pub async fn encoder_task(
     let limit_max: i32 = 1001 * 4;
     let mut btn_was_pressed = false;
 
+    // --- НОВЫЕ ПЕРЕМЕННЫЕ ДЛЯ АВТО-ОГРАНИЧЕНИЯ ТОКА ---
+    let mut last_duty_change_at = embassy_time::Instant::now();
+    let mut current_locked = true; // При загрузке ток зафиксирован из флеша
+    let mut last_auto_mode = crate::AUTO_MODE.load(Ordering::Relaxed);
+
     info!("Encoder & PWM Manager task started!");
 
     loop {
@@ -77,18 +82,24 @@ pub async fn encoder_task(
         // 3. Применяем новое значение к железу, если оно изменилось
         if duty_changed {
             let logical_duty = (absolute_raw / 4) as u32;
-
-            // Масштабируем 0..1001 в 0..max_duty
             let hardware_duty = ((logical_duty as u64 * max_duty as u64) / 1001) as u32;
 
             pwm.ch1().set_duty_cycle(hardware_duty);
-
-            // Публикуем новое логическое значение для отправки в GSM и обратно в DWIN
             PWM1_ACTUAL.store(logical_duty, Ordering::Relaxed);
 
-            // Сбрасываем таймер на сохранение ТОЛЬКО если нет флага skip_save
+            // Таймер для ручного энкодера
             if !skip_save {
                 crate::FLASH_SAVE_COUNTDOWN.store(10, Ordering::Relaxed);
+            }
+
+            // --- СНИМАЕМ ОГРАНИЧЕНИЕ ТОКА ПРИ ЛЮБОМ ДВИЖЕНИИ НАПРЯЖЕНИЯ ---
+            last_duty_change_at = embassy_time::Instant::now();
+            if current_locked {
+                current_locked = false;
+                crate::PWM2_ACTUAL.store(950, Ordering::Relaxed); // Отпускаем на 95%
+                let pwm2_hw = ((950_u64 * max_duty as u64) / 1000) as u32;
+                pwm.ch2().set_duty_cycle(pwm2_hw);
+                info!("Ограничение тока снято (95%) для регулировки напряжения");
             }
 
             info!(
@@ -104,6 +115,58 @@ pub async fn encoder_task(
             // Позже сюда можно добавить логику сброса ШИМ или перехода в меню
         }
         btn_was_pressed = btn_is_pressed;
+
+        // 5. --- АВТОМАТИЧЕСКАЯ ФИКСАЦИЯ ТОКА И АВТО-РЕЖИМ ---
+        let auto_mode = crate::AUTO_MODE.load(Ordering::Relaxed);
+
+        if auto_mode && !last_auto_mode {
+            // Включили авто-режим (удержание потенциала)
+            let pwm2_limit = 333; // 10 Ампер защиты
+            crate::PWM2_ACTUAL.store(pwm2_limit, Ordering::Relaxed);
+            let pwm2_hw = ((pwm2_limit as u64 * max_duty as u64) / 1000) as u32;
+            pwm.ch2().set_duty_cycle(pwm2_hw);
+            info!("Авто-режим: Ограничение тока жестко установлено на 10А");
+            current_locked = true;
+        } else if !auto_mode && last_auto_mode {
+            // Выключили авто-режим - отпускаем ток для ручной настройки
+            last_duty_change_at = embassy_time::Instant::now();
+            current_locked = false;
+            let pwm2_limit = 950;
+            crate::PWM2_ACTUAL.store(pwm2_limit, Ordering::Relaxed);
+            let pwm2_hw = ((pwm2_limit as u64 * max_duty as u64) / 1000) as u32;
+            pwm.ch2().set_duty_cycle(pwm2_hw);
+            info!("Выход из авто-режима: Ограничение тока снято (95%)");
+        }
+        last_auto_mode = auto_mode;
+
+        // Если 10 секунд не было регулировки напряжения - "замораживаем" ток
+        if !current_locked && !auto_mode && last_duty_change_at.elapsed().as_secs() >= 10 {
+            current_locked = true;
+
+            // Читаем фактический ток в трубе
+            let current_i_mv = crate::I1_ACTUAL_MV.load(Ordering::Relaxed);
+            let current_amps = (current_i_mv as f32) / 1000.0;
+
+            // Запас: +10% от текущего + 0.5А защиты от шумов на малых токах
+            let limit_amps = (current_amps * 1.1) + 0.5;
+
+            // Перевод в ШИМ (1000 ШИМ = 30А -> 33.33 ШИМ на 1А)
+            let limit_pwm = ((limit_amps * 33.33) as u32).clamp(0, 950);
+
+            crate::PWM2_ACTUAL.store(limit_pwm, Ordering::Relaxed);
+            let pwm2_hw = ((limit_pwm as u64 * max_duty as u64) / 1000) as u32;
+            pwm.ch2().set_duty_cycle(pwm2_hw);
+
+            info!(
+                "Ток зафиксирован на {} мА (PWM2: {})",
+                (limit_amps * 1000.0) as i32,
+                limit_pwm
+            );
+
+            // Сохраняем новые настройки во флеш (Это гарантирует сохранение
+            // даже команд с сервера, минуя спам промежуточных шагов доводчика!)
+            crate::SAVE_FLASH_REQUEST.store(true, Ordering::Relaxed);
+        }
     }
 }
 

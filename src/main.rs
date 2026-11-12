@@ -400,48 +400,67 @@ pub async fn flash_manager_task() {
                 );
             }
 
-            info!("Сохранение во флеш (Прямой доступ к регистрам)...");
+            info!("Сохранение во флеш (Алгоритм Wear Leveling)...");
+
+            let mut target_index = 0; // Объявляем вне unsafe, чтобы использовать в конце лога
 
             unsafe {
                 let flash_keyr = 0x40023C04 as *mut u32;
                 let flash_sr = 0x40023C0C as *mut u32;
                 let flash_cr = 0x40023C10 as *mut u32;
 
-                // 1. Разблокировка флеш-памяти (Unlock)
+                // --- 1. ИЩЕМ СВОБОДНУЮ ЯЧЕЙКУ ---
+                let flash_base = flash_addr as *const SavedConfig;
+                let mut need_erase = false;
+
+                for i in 0..3270 {
+                    let cfg_ptr = flash_base.add(i);
+                    let magic_val = core::ptr::read_volatile(cfg_ptr as *const u32);
+
+                    if magic_val == 0xFFFFFFFF {
+                        target_index = i;
+                        break;
+                    }
+                    if i == 3269 {
+                        need_erase = true; // Сектор забит до отказа
+                    }
+                }
+
+                // --- 2. РАЗБЛОКИРОВКА ФЛЕШ-ПАМЯТИ ---
                 core::ptr::write_volatile(flash_keyr, 0x45670123);
                 core::ptr::write_volatile(flash_keyr, 0xCDEF89AB);
 
                 // Ждем готовности (BSY == 0)
                 while (core::ptr::read_volatile(flash_sr) & (1 << 16)) != 0 {}
 
-                // 2. Стирание сектора 11
-                // SNB = 11 (биты 6:3) -> 11 << 3. SER = 1 (бит 1).
+                // --- 3. СТИРАНИЕ (ТОЛЬКО ЕСЛИ СЕКТОР ЗАПОЛНЕН) ---
+                if need_erase {
+                    info!("Сектор заполнен. Выполняем полное стирание (Erase)...");
+                    let mut cr = core::ptr::read_volatile(flash_cr);
+                    cr &= !(0xF << 3);
+                    cr |= (11 << 3) | (1 << 1);
+                    core::ptr::write_volatile(flash_cr, cr);
+
+                    core::ptr::write_volatile(flash_cr, cr | (1 << 16));
+
+                    while (core::ptr::read_volatile(flash_sr) & (1 << 16)) != 0 {}
+
+                    cr = core::ptr::read_volatile(flash_cr);
+                    core::ptr::write_volatile(flash_cr, cr & !(1 << 1));
+                    target_index = 0;
+                }
+
+                // --- 4. ЗАПИСЬ ДАННЫХ В ЦЕЛЕВУЮ ЯЧЕЙКУ ---
                 let mut cr = core::ptr::read_volatile(flash_cr);
-                cr &= !(0xF << 3); // Очищаем старый номер сектора
-                cr |= (11 << 3) | (1 << 1);
-                core::ptr::write_volatile(flash_cr, cr);
-
-                // Старт стирания (STRT = бит 16)
-                core::ptr::write_volatile(flash_cr, cr | (1 << 16));
-
-                // Ждем завершения стирания
-                while (core::ptr::read_volatile(flash_sr) & (1 << 16)) != 0 {}
-
-                // Отключаем режим стирания
-                cr = core::ptr::read_volatile(flash_cr);
-                core::ptr::write_volatile(flash_cr, cr & !(1 << 1));
-
-                // 3. Запись данных
-                // PSIZE = 32-bit (биты 9:8) -> 2 << 8. PG = 1 (бит 0).
-                cr = core::ptr::read_volatile(flash_cr);
                 cr &= !(3 << 8);
                 cr |= (2 << 8) | (1 << 0);
                 core::ptr::write_volatile(flash_cr, cr);
 
-                let flash_ptr = flash_addr as *mut u32;
+                // Вычисляем адрес для записи (смещаемся на target_index структур по 40 байт)
+                let write_ptr = (flash_addr as *mut SavedConfig).add(target_index) as *mut u32;
+
                 for i in 0..10 {
-                    core::ptr::write_volatile(flash_ptr.add(i), write_buf[i]);
-                    // Ждем завершения записи слова
+                    core::ptr::write_volatile(write_ptr.add(i), write_buf[i]);
                     while (core::ptr::read_volatile(flash_sr) & (1 << 16)) != 0 {}
                 }
 
@@ -449,12 +468,12 @@ pub async fn flash_manager_task() {
                 cr = core::ptr::read_volatile(flash_cr);
                 core::ptr::write_volatile(flash_cr, cr & !(1 << 0));
 
-                // 4. Блокируем флеш (LOCK = бит 31)
+                // --- 5. БЛОКИРУЕМ ФЛЕШ (LOCK = бит 31) ---
                 cr = core::ptr::read_volatile(flash_cr);
                 core::ptr::write_volatile(flash_cr, cr | (1 << 31));
             }
 
-            info!("Сохранение завершено!");
+            info!("Сохранение завершено! (Слот #{})", target_index);
         }
     }
 }
@@ -501,15 +520,20 @@ async fn main(spawner: Spawner) {
     //-----------------------------------------------------------
 
     // чтение из флэш памяти сохраненых настроек
-    // Создаем драйвер флеш-памяти
+    let flash_base = 0x080E_0000 as *const SavedConfig;
+    let mut latest_config: Option<SavedConfig> = None;
 
-    // чтение из флэш памяти сохраненых настроек
-    let flash_addr: u32 = 0x080E_0000; // 1Mb (Сектор 11)
+    // Ищем самую свежую запись (Сектор 11 вмещает 3276 структур по 40 байт)
+    for i in 0..3270 {
+        let config = unsafe { &*flash_base.add(i) };
+        if config.magic == MAGIC_WORD {
+            latest_config = Some(*config); // Запоминаем валидную
+        } else if config.magic == 0xFFFFFFFF {
+            break; // Нашли пустую область, дальше искать нет смысла
+        }
+    }
 
-    // Читаем структуру напрямую из памяти
-    let saved_config = unsafe { &*(flash_addr as *const SavedConfig) };
-
-    if saved_config.magic == MAGIC_WORD {
+    if let Some(saved_config) = latest_config {
         info!("Найдена валидная конфигурация во флеш-памяти!");
         // Восстанавливаем значения
         ENERGY_KWH.store(saved_config.energy_kwh.to_bits(), Ordering::Relaxed);

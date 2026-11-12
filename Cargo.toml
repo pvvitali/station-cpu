@@ -41,3 +41,14 @@ embedded-io-async = { version = "0.7.0", default-features = false }
 # Оптимизируем ядро языка (core/alloc)
 #[profile.dev.build-override]
 #opt-level = "s"
+
+[profile.release]
+opt-level = "s"       # Оптимизация по размеру ("z" для еще более агрессивного сжатия, 3 - для максимальной скорости)
+lto = true            # Link Time Optimization: компилятор анализирует весь код целиком и вырезает всё неиспользуемое
+codegen-units = 1     # Замедляет компиляцию, но дает компилятору возможность лучше оптимизировать код
+debug = false         # Отключает генерацию отладочных символов
+strip = false         # Вырезает символы и отладочную информацию из итогового бинарника
+panic = "abort"       # Мгновенная остановка при панике (экономит память, убирая код "раскрутки" стека)
+
+#cargo build --release
+#probe-rs run --chip STM32F412RG target\thumbv7em-none-eabihf\release\station-cpu

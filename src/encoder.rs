@@ -87,10 +87,10 @@ pub async fn encoder_task(
             pwm.ch1().set_duty_cycle(hardware_duty);
             PWM1_ACTUAL.store(logical_duty, Ordering::Relaxed);
 
-            // Таймер для ручного энкодера
-            if !skip_save {
-                crate::FLASH_SAVE_COUNTDOWN.store(10, Ordering::Relaxed);
-            }
+            // // Таймер для ручного энкодера
+            // if !skip_save {
+            //     crate::FLASH_SAVE_COUNTDOWN.store(10, Ordering::Relaxed);
+            // }
 
             // --- СНИМАЕМ ОГРАНИЧЕНИЕ ТОКА ПРИ ЛЮБОМ ДВИЖЕНИИ НАПРЯЖЕНИЯ ---
             last_duty_change_at = embassy_time::Instant::now();

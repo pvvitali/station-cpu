@@ -81,16 +81,23 @@ pub async fn encoder_task(
 
         // 3. Применяем новое значение к железу, если оно изменилось
         if duty_changed {
-            let logical_duty = (absolute_raw / 4) as u32;
+            let mut logical_duty = (absolute_raw / 4) as u32;
+
+            // --- ОГРАНИЧЕНИЕ 10 АМПЕР ---
+            // Если включен лимит, максимальный логический ШИМ = 1001 / 3 (примерно 333)
+            if crate::LIMIT_10A_EN.load(Ordering::Relaxed) {
+                logical_duty = logical_duty.clamp(0, 333);
+                // Синхронизируем absolute_raw с обрезанным значением,
+                // чтобы при вращении энкодера не было "холостого хода"
+                absolute_raw = (logical_duty * 4) as i32;
+            } else {
+                logical_duty = logical_duty.clamp(0, 1001);
+            }
+
             let hardware_duty = ((logical_duty as u64 * max_duty as u64) / 1001) as u32;
 
             pwm.ch1().set_duty_cycle(hardware_duty);
             PWM1_ACTUAL.store(logical_duty, Ordering::Relaxed);
-
-            // // Таймер для ручного энкодера
-            // if !skip_save {
-            //     crate::FLASH_SAVE_COUNTDOWN.store(10, Ordering::Relaxed);
-            // }
 
             // --- СНИМАЕМ ОГРАНИЧЕНИЕ ТОКА ПРИ ЛЮБОМ ДВИЖЕНИИ НАПРЯЖЕНИЯ ---
             last_duty_change_at = embassy_time::Instant::now();
@@ -293,7 +300,13 @@ pub async fn auto_regulation_task() {
             current_pwm -= step; // Перестарались, нужно убавить
         }
 
-        current_pwm = current_pwm.clamp(0, 1001);
+        let max_auto_pwm = if crate::LIMIT_10A_EN.load(Ordering::Relaxed) {
+            333 // Ограничиваем возможности авто-режима 10 Амперами
+        } else {
+            1001 // Полная мощность
+        };
+
+        current_pwm = current_pwm.clamp(0, max_auto_pwm);
 
         // Отправляем новое значение ШИМ со скрытым битом, чтобы сберечь флеш-память!
         let _ = crate::PWM_CHANNEL.try_send((current_pwm as u32) | (1 << 31));

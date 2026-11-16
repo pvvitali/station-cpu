@@ -98,45 +98,129 @@ pub async fn dwin_task(
 
                                     if pkt_len >= 6 && pkt[3] == 0x83 {
                                         let addr = ((pkt[4] as u16) << 8) | (pkt[5] as u16);
-                                        let data = ((pkt[7] as u16) << 8) | (pkt[8] as u16);
+                                        let data_len = pkt[6] as usize * 2; // Длина данных в байтах
 
-                                        match addr {
-                                            0x5012 => {
-                                                info!("-> Изменение ШИМ: {}", data);
+                                        if addr == 0x5032 && data_len == 4 && pkt.len() >= 11 {
+                                            // --- ОБРАБОТКА FLOAT (4 байта) ДЛЯ ЦЕЛЕВОГО ПОТЕНЦИАЛА ---
+                                            let bits = ((pkt[7] as u32) << 24)
+                                                | ((pkt[8] as u32) << 16)
+                                                | ((pkt[9] as u32) << 8)
+                                                | (pkt[10] as u32);
 
-                                                // --- ОТКЛЮЧАЕМ АВТО-РЕЖИМ ПРИ РУЧНОМ УПРАВЛЕНИИ С ЭКРАНА ---
-                                                if crate::AUTO_MODE.load(Ordering::Relaxed) {
-                                                    crate::AUTO_MODE
-                                                        .store(false, Ordering::Relaxed);
-                                                    info!(
-                                                        "Ручное вмешательство (DWIN): Авто-режим отключен!"
-                                                    );
-                                                    // Сохранение во флеш-память автоматически подхватится
-                                                    // через 10-секундный таймер в задаче энкодера.
-                                                }
+                                            let target_v = f32::from_bits(bits);
+                                            // Берем чистый модуль и переводим Вольты в милливольты
+                                            // чтобы 1199.999 превратилось ровно в 1200
+                                            // Прибавляем 0.5 для правильного математического округления
+                                            let target_mv = (target_v.abs() * 1000.0 + 0.5) as i32;
 
-                                                // Отправляем значение от экрана в канал управления ШИМ
-                                                let _ = crate::PWM_CHANNEL.try_send(data as u32);
-                                            }
-                                            0x5017 => info!("-> Аккумулятор: {}", data),
-                                            // Внутри rx_fut, где парсится адрес 0x5030
-                                            0x5030 => {
-                                                info!("-> GSM Переключатель (DWIN): {}", data);
-                                                crate::GSM_ON.store(data > 0, Ordering::Relaxed);
-                                                // При изменении настроек сразу запрашиваем сохранение
-                                                crate::SAVE_FLASH_REQUEST
+                                            info!(
+                                                "-> DWIN: Целевой потенциал = {} мВ (Введено: {} В)",
+                                                target_mv, target_v
+                                            );
+
+                                            crate::AUTO_TARGET_MV
+                                                .store(target_mv, Ordering::Relaxed);
+                                            crate::SAVE_FLASH_REQUEST
+                                                .store(true, Ordering::Relaxed);
+
+                                            if crate::AUTO_MODE.load(Ordering::Relaxed) {
+                                                crate::FORCE_TELEMETRY_UPDATE
                                                     .store(true, Ordering::Relaxed);
                                             }
-                                            //// Если добавишь 0x5014 для ШИМ2 (тока):
-                                            // 0x5014 => {
-                                            //     crate::PWM2_ACTUAL
-                                            //         .store(data as u32, Ordering::Relaxed);
-                                            //     crate::SAVE_FLASH_REQUEST
-                                            //         .store(true, Ordering::Relaxed);
-                                            // }
-                                            _ => {}
+                                        } else if data_len == 2 && pkt.len() >= 9 {
+                                            // --- СТАНДАРТНАЯ ОБРАБОТКА INT16 (2 байта) ---
+                                            let data = ((pkt[7] as u16) << 8) | (pkt[8] as u16);
+
+                                            match addr {
+                                                0x5012 => {
+                                                    info!("-> Изменение ШИМ: {}", data);
+                                                    if crate::AUTO_MODE.load(Ordering::Relaxed) {
+                                                        crate::AUTO_MODE
+                                                            .store(false, Ordering::Relaxed);
+                                                        info!(
+                                                            "Ручное вмешательство (DWIN): Авто-режим отключен!"
+                                                        );
+                                                    }
+                                                    let _ =
+                                                        crate::PWM_CHANNEL.try_send(data as u32);
+                                                }
+                                                0x5030 => {
+                                                    info!("-> GSM Переключатель (DWIN): {}", data);
+                                                    crate::GSM_ON
+                                                        .store(data > 0, Ordering::Relaxed);
+                                                    crate::SAVE_FLASH_REQUEST
+                                                        .store(true, Ordering::Relaxed);
+                                                }
+                                                0x5031 => {
+                                                    let is_auto = data > 0;
+                                                    info!("-> DWIN: АВТО-РЕЖИМ = {}", is_auto);
+                                                    crate::AUTO_MODE
+                                                        .store(is_auto, Ordering::Relaxed);
+                                                    crate::SAVE_FLASH_REQUEST
+                                                        .store(true, Ordering::Relaxed);
+                                                }
+                                                0x5038 => {
+                                                    let is_limit = data > 0;
+                                                    info!("-> DWIN: Лимит 10А = {}", is_limit);
+                                                    crate::LIMIT_10A_EN
+                                                        .store(is_limit, Ordering::Relaxed);
+                                                    crate::SAVE_FLASH_REQUEST
+                                                        .store(true, Ordering::Relaxed);
+                                                }
+                                                0x5039 => {
+                                                    let is_mode = data > 0;
+                                                    info!("-> DWIN: Регулировка V/I = {}", is_mode);
+                                                    crate::V_I_MODE_EN
+                                                        .store(is_mode, Ordering::Relaxed);
+                                                    crate::SAVE_FLASH_REQUEST
+                                                        .store(true, Ordering::Relaxed);
+                                                }
+                                                _ => {}
+                                            }
                                         }
                                     }
+
+                                    // if pkt_len >= 6 && pkt[3] == 0x83 {
+                                    //     let addr = ((pkt[4] as u16) << 8) | (pkt[5] as u16);
+                                    //     let data = ((pkt[7] as u16) << 8) | (pkt[8] as u16);
+
+                                    //     match addr {
+                                    //         0x5012 => {
+                                    //             info!("-> Изменение ШИМ: {}", data);
+
+                                    //             // --- ОТКЛЮЧАЕМ АВТО-РЕЖИМ ПРИ РУЧНОМ УПРАВЛЕНИИ С ЭКРАНА ---
+                                    //             if crate::AUTO_MODE.load(Ordering::Relaxed) {
+                                    //                 crate::AUTO_MODE
+                                    //                     .store(false, Ordering::Relaxed);
+                                    //                 info!(
+                                    //                     "Ручное вмешательство (DWIN): Авто-режим отключен!"
+                                    //                 );
+                                    //                 // Сохранение во флеш-память автоматически подхватится
+                                    //                 // через 10-секундный таймер в задаче энкодера.
+                                    //             }
+
+                                    //             // Отправляем значение от экрана в канал управления ШИМ
+                                    //             let _ = crate::PWM_CHANNEL.try_send(data as u32);
+                                    //         }
+                                    //         0x5017 => info!("-> Аккумулятор: {}", data),
+                                    //         // Внутри rx_fut, где парсится адрес 0x5030
+                                    //         0x5030 => {
+                                    //             info!("-> GSM Переключатель (DWIN): {}", data);
+                                    //             crate::GSM_ON.store(data > 0, Ordering::Relaxed);
+                                    //             // При изменении настроек сразу запрашиваем сохранение
+                                    //             crate::SAVE_FLASH_REQUEST
+                                    //                 .store(true, Ordering::Relaxed);
+                                    //         }
+                                    //         //// Если добавишь 0x5014 для ШИМ2 (тока):
+                                    //         // 0x5014 => {
+                                    //         //     crate::PWM2_ACTUAL
+                                    //         //         .store(data as u32, Ordering::Relaxed);
+                                    //         //     crate::SAVE_FLASH_REQUEST
+                                    //         //         .store(true, Ordering::Relaxed);
+                                    //         // }
+                                    //         _ => {}
+                                    //     }
+                                    // }
                                     i += full_pkt_len;
                                     continue;
                                 }
@@ -218,6 +302,33 @@ pub async fn dwin_task(
             dwin_write_float(&mut tx, 0x5006, kwh).await; // Энергия[cite: 16]
             dwin_write_int32(&mut tx, 0x5008, hours).await; // Часы наработки[cite: 16]
             dwin_write_int16(&mut tx, 0x5030, gsm_on_val).await; // Состояние GSM[cite: 16]
+
+            // --- ДОБАВЛЕННЫЕ ДАННЫЕ АВТО-РЕЖИМА ---
+            let auto_mode_val: u16 = if crate::AUTO_MODE.load(Ordering::Relaxed) {
+                1
+            } else {
+                0
+            };
+            // Всегда отдаем экрану чистое положительное число вольтах (Float)
+            let target_mv = crate::AUTO_TARGET_MV.load(Ordering::Relaxed).abs();
+            let target_v_display = (target_mv as f32) / 1000.0;
+
+            dwin_write_int16(&mut tx, 0x5031, auto_mode_val).await;
+            dwin_write_float(&mut tx, 0x5032, target_v_display).await;
+
+            let limit_val: u16 = if crate::LIMIT_10A_EN.load(Ordering::Relaxed) {
+                1
+            } else {
+                0
+            };
+            let vi_mode_val: u16 = if crate::V_I_MODE_EN.load(Ordering::Relaxed) {
+                1
+            } else {
+                0
+            };
+
+            dwin_write_int16(&mut tx, 0x5038, limit_val).await;
+            dwin_write_int16(&mut tx, 0x5039, vi_mode_val).await;
 
             // Если для Bluetooth есть свой адрес в DGUS (например, 0x5032), добавь:
             // dwin_write_int16(&mut tx, 0x5032, 1).await;

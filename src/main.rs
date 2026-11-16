@@ -84,6 +84,10 @@ pub static TELEMETRY_PERIOD_SECS: AtomicU32 = AtomicU32::new(60);
 pub static AUTO_MODE: AtomicBool = AtomicBool::new(false);
 pub static AUTO_TARGET_MV: AtomicI32 = AtomicI32::new(0);
 
+pub static LIMIT_10A_EN: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+pub static V_I_MODE_EN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 // ------------------------------------------------
 
 // --- ДОБАВЛЕННЫЙ КОД ДЛЯ ДОВОДЧИКА НАПРЯЖЕНИЯ ---
@@ -131,8 +135,10 @@ pub struct SavedConfig {
     pub pwm2_logical: u32,
     pub gsm_on: u32,
     pub telemetry_period: u32,
-    pub auto_mode: u32,      // <-- ДОБАВЛЕНО (1 или 0)
-    pub auto_target_mv: i32, // <-- ДОБАВЛЕНО
+    pub auto_mode: u32,      //  (1 или 0)
+    pub auto_target_mv: i32, //
+    pub limit_10a: bool,
+    pub v_i_mode: bool,
 }
 
 const MAGIC_WORD: u32 = 0xAA55AA55;
@@ -388,6 +394,8 @@ pub async fn flash_manager_task() {
                     0
                 },
                 auto_target_mv: crate::AUTO_TARGET_MV.load(Ordering::Relaxed),
+                limit_10a: crate::LIMIT_10A_EN.load(Ordering::Relaxed),
+                v_i_mode: crate::V_I_MODE_EN.load(Ordering::Relaxed),
             };
 
             // Готовим выровненный буфер (10 слов u32)
@@ -555,6 +563,8 @@ async fn main(spawner: Spawner) {
         if t_mv > -5000 && t_mv < 5000 {
             crate::AUTO_TARGET_MV.store(t_mv, Ordering::Relaxed);
         }
+        crate::LIMIT_10A_EN.store(saved_config.limit_10a, Ordering::Relaxed);
+        crate::V_I_MODE_EN.store(saved_config.v_i_mode, Ordering::Relaxed);
     } else {
         info!("Флеш-память пуста или повреждена. Применяем настройки по умолчанию.");
         // Значения по умолчанию уже заданы при объявлении (PWM1=0, PWM2=333, GSM=true, etc.)

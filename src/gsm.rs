@@ -28,6 +28,15 @@ fn crc_8(data: &[u8]) -> u8 {
     crc
 }
 
+// Вспомогательная функция для точного округления при делении целых чисел
+fn round_div(val: i32, div: i32) -> i32 {
+    if val >= 0 {
+        (val + div / 2) / div
+    } else {
+        (val - div / 2) / div
+    }
+}
+
 macro_rules! send_at {
     ($uart:expr, $rx_buf:expr, $cmd:expr, $expected:expr, $wait_ms:expr) => {{
         // Вычитываем буфер досуха (пока не наступит таймаут)
@@ -138,7 +147,8 @@ fn parse_server_command(msg: &str) -> ServerCommand {
             if let Ok(target) = parts[2].parse::<i32>() {
                 ServerCommand::SetAuto {
                     tx_id,
-                    target_u_mv: target * 10, // Переводим -125 (сотые) в -1250 мВ!
+                    // БЕРЕМ МОДУЛЬ! Если прилетело -125, станет 1250 мВ. Если 125, тоже 1250.
+                    target_u_mv: (target * 10).abs(),
                 }
             } else {
                 ServerCommand::Unknown
@@ -405,19 +415,19 @@ pub async fn gsm_task(
                 let csq_raw = crate::GSM_SIGNAL.load(core::sync::atomic::Ordering::Relaxed);
 
                 // 0 - HardwareId
-                let id_str = "10000601";
+                let id_str = "10000602";
 
                 // 1 - Выходной ток * 10 (мА / 100) -> 30.2A = 302
-                let i_str = i1_mv / 100;
+                let i_str = round_div(i1_mv, 100);
 
                 // 2 - Выходное напряжение * 10 (мВ / 100) -> -21.5V = -215
-                let u_str = u1_mv / 100;
+                let u_str = round_div(u1_mv, 100);
 
                 // 3 - Защитный потенциал * 100 (мВ / 10) -> 8.3V = 830
-                let p_str = p1_mv / 10;
+                let p_str = round_div(p1_mv, 10);
 
                 // 4 - Напряжение батареи * 10 (мВ / 100) -> 4.2V = 42
-                let bat_str = bat_mv / 100;
+                let bat_str = round_div(bat_mv as i32, 100);
 
                 // сырые 0..31
                 let gsm_percent = csq_raw;
@@ -431,7 +441,7 @@ pub async fn gsm_task(
                 let door_str = if is_door_closed { "0" } else { "1" };
 
                 // 8 - Температура (целые градусы)
-                let temp_c = temp_x10 / 10;
+                let temp_c = round_div(temp_x10, 10);
 
                 // 9 - Энергия кВт*ч (целое число [int], без умножения на 10)
                 let energy_kwh =
@@ -451,9 +461,11 @@ pub async fn gsm_task(
                 let is_auto = crate::AUTO_MODE.load(core::sync::atomic::Ordering::Relaxed);
                 let auto_mode = if is_auto { "1" } else { "0" };
 
-                // 14 - Целевой потенциал (делим на 10, чтобы из -1250 мВ получить -125 для сервера)
-                let target_mv = crate::AUTO_TARGET_MV.load(core::sync::atomic::Ordering::Relaxed);
-                let auto_value = target_mv / 10;
+                // 14 - Целевой потенциал (только положительное число)
+                let target_mv = crate::AUTO_TARGET_MV
+                    .load(core::sync::atomic::Ordering::Relaxed)
+                    .abs();
+                let auto_value = round_div(target_mv, 10);
 
                 let mut payload = heapless::String::<256>::new();
                 core::fmt::write(

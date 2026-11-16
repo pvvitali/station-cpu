@@ -255,6 +255,9 @@ pub async fn gsm_task(
     send_at!(uart, rx_buf, b"ATE0\r\n", "OK", 1000);
     info!("GSM: Связь AT установлена.");
 
+    // --- НОВАЯ ПЕРЕМЕННАЯ ДЛЯ УПРАВЛЕНИЯ SIM-КАРТАМИ ---
+    let mut active_sim = 0; // 0 = SIM1, 1 = SIM2
+
     loop {
         // --- СБРОС ФЛАГОВ ПЕРЕД НОВОЙ ПОПЫТКОЙ РЕГИСТРАЦИИ ---
         crate::GSM_OK.store(false, core::sync::atomic::Ordering::Relaxed);
@@ -293,19 +296,22 @@ pub async fn gsm_task(
         }
         // ========================================================
 
-        info!("GSM: Регистрация в сети и настройка...");
+        info!(
+            "GSM: Регистрация в сети и настройка (Слот {})...",
+            active_sim + 1
+        );
+
+        let mut is_registered = false;
+        let mut reg_attempts = 0;
+        let mut cpin_errors = 0;
 
         loop {
             let _ =
                 with_timeout(Duration::from_millis(50), uart.read_until_idle(&mut rx_buf)).await;
-            let _ = uart.write_all(b"AT+CPIN?\r\n").await;
-            let _ = with_timeout(
-                Duration::from_millis(1000),
-                uart.read_until_idle(&mut rx_buf),
-            )
-            .await;
 
-            let _ = uart.write_all(b"AT+CEREG?\r\n").await;
+            // 1. Проверяем физическое наличие SIM-карты
+            let mut sim_ready = false;
+            let _ = uart.write_all(b"AT+CPIN?\r\n").await;
             if let Ok(Ok(len)) = with_timeout(
                 Duration::from_millis(1000),
                 uart.read_until_idle(&mut rx_buf),
@@ -313,32 +319,92 @@ pub async fn gsm_task(
             .await
             {
                 if let Ok(resp) = str::from_utf8(&rx_buf[..len]) {
-                    let text = resp.trim();
-                    if text.contains("+CEREG: 0,1\r")
-                        || text.contains("+CEREG: 0,5\r")
-                        || text.contains("+CEREG: 1,1\r")
-                        || text.contains("+CEREG: 1,5\r")
-                    {
-                        break;
+                    if resp.contains("READY") {
+                        sim_ready = true;
+                        cpin_errors = 0; // Карта на месте, сбрасываем счетчик ошибок
+                    } else if resp.contains("ERROR") {
+                        cpin_errors += 1; // Карты нет или она не читается
                     }
                 }
             }
 
-            let _ = uart.write_all(b"AT+CREG?\r\n").await;
-            if let Ok(Ok(len)) = with_timeout(
-                Duration::from_millis(1000),
-                uart.read_until_idle(&mut rx_buf),
-            )
-            .await
-            {
-                if let Ok(resp) = str::from_utf8(&rx_buf[..len]) {
-                    let text = resp.trim();
-                    if text.contains("+CREG: 0,1\r") || text.contains("+CREG: 0,5\r") {
-                        break;
+            // БЫСТРЫЙ СБРОС: Если физически нет SIM-карты, переключаемся через 3sec(3*1) (~9 секунд3*3)
+            if cpin_errors >= 1 {
+                error!("GSM: SIM-карта не обнаружена! Ускоренная смена слота...");
+                break;
+            }
+
+            // 2. Если карта на месте, проверяем регистрацию в сети
+            if sim_ready {
+                let _ = uart.write_all(b"AT+CEREG?\r\n").await;
+                if let Ok(Ok(len)) = with_timeout(
+                    Duration::from_millis(1000),
+                    uart.read_until_idle(&mut rx_buf),
+                )
+                .await
+                {
+                    if let Ok(resp) = str::from_utf8(&rx_buf[..len]) {
+                        if resp.contains("+CEREG: 0,1")
+                            || resp.contains("+CEREG: 0,5")
+                            || resp.contains("+CEREG: 1,1")
+                            || resp.contains("+CEREG: 1,5")
+                        {
+                            is_registered = true;
+                        }
                     }
                 }
+
+                let _ = uart.write_all(b"AT+CREG?\r\n").await;
+                if let Ok(Ok(len)) = with_timeout(
+                    Duration::from_millis(1000),
+                    uart.read_until_idle(&mut rx_buf),
+                )
+                .await
+                {
+                    if let Ok(resp) = str::from_utf8(&rx_buf[..len]) {
+                        if resp.contains("+CREG: 0,1") || resp.contains("+CREG: 0,5") {
+                            is_registered = true;
+                        }
+                    }
+                }
+            }
+
+            if is_registered {
+                break;
+            }
+
+            // Счетчик неудачных попыток регистрации в сети
+            reg_attempts += 1;
+            if reg_attempts >= 13 {
+                // ~40 секунд на поиск сети при вставленной SIM
+                error!("GSM: Тайм-аут регистрации в сети! Смена SIM-карты...");
+                break;
             }
             Timer::after_secs(3).await;
+        }
+
+        // --- ЛОГИКА ПЕРЕКЛЮЧЕНИЯ SIM ПРИ ОШИБКЕ ---
+        if !is_registered {
+            active_sim = if active_sim == 0 { 1 } else { 0 };
+
+            let mut cmd = heapless::String::<32>::new();
+            core::fmt::write(
+                &mut cmd,
+                format_args!("AT*SELECTSIMSLOT={},1\r\n", active_sim),
+            )
+            .unwrap();
+            let _ = send_at!(uart, rx_buf, cmd.as_bytes(), "OK", 2000);
+
+            info!(
+                "GSM: Перезагрузка радиомодуля для слота {}...",
+                active_sim + 1
+            );
+            let _ = send_at!(uart, rx_buf, b"AT+CFUN=0\r\n", "OK", 5000);
+            Timer::after_secs(2).await;
+            let _ = send_at!(uart, rx_buf, b"AT+CFUN=1\r\n", "OK", 5000);
+            Timer::after_secs(4).await; // Даем модулю время загрузить SIM
+
+            continue;
         }
 
         info!("GSM: Регистрация успешна! Настраиваем APN...");

@@ -8,9 +8,9 @@ rustflags = [
 [build]
 target = "thumbv7em-none-eabihf"
 
-[env]
-DEFMT_LOG = "info"
-
 #[env]
-## Оставит только error!(). Если хотите выключить логи ПОЛНОСТЬЮ, напишите "off"
-#DEFMT_LOG = "error"
+#DEFMT_LOG = "info"
+
+[env]
+# Оставит только error!(). Если хотите выключить логи ПОЛНОСТЬЮ, напишите "off"
+DEFMT_LOG = "error"

@@ -746,16 +746,18 @@ pub async fn gsm_task(
                                                 core::sync::atomic::Ordering::Relaxed,
                                             );
 
-                                            // Читаем сохраненное значение напрямую из сектора флеш-памяти
-                                            let flash_addr: u32 = 0x080E_0000;
-                                            let saved_config = unsafe {
-                                                &*(flash_addr as *const crate::SavedConfig)
-                                            };
-                                            let restore_pwm = if saved_config.magic == 0xAA55AA55 {
-                                                saved_config.pwm1_logical
-                                            } else {
-                                                0
-                                            };
+                                            // ИЩЕМ ПОСЛЕДНЮЮ АКТУАЛЬНУЮ ЗАПИСЬ ВО ФЛЕШКЕ
+                                            let mut restore_pwm = 0;
+                                            let flash_base =
+                                                0x080E_0000 as *const crate::SavedConfig;
+                                            for i in 0..2970 {
+                                                let config = unsafe { &*flash_base.add(i) };
+                                                if config.magic == 0xAA55AA55 {
+                                                    restore_pwm = config.pwm1_logical;
+                                                } else if config.magic == 0xFFFFFFFF {
+                                                    break; // Нашли конец записей
+                                                }
+                                            }
 
                                             // Восстанавливаем ШИМ, приклеиваем бит 31 (в памяти и так уже лежит это число, не затираем ресурс флешки)
                                             let _ = crate::PWM_CHANNEL

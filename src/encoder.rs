@@ -81,19 +81,8 @@ pub async fn encoder_task(
 
         // 3. Применяем новое значение к железу, если оно изменилось
         if duty_changed {
-            let mut logical_duty = (absolute_raw / 4) as u32;
-
-            // --- ОГРАНИЧЕНИЕ 10 АМПЕР ---
-            // Если включен лимит, максимальный логический ШИМ = 1001 / 3 (примерно 333)
-            if crate::LIMIT_10A_EN.load(Ordering::Relaxed) {
-                logical_duty = logical_duty.clamp(0, 333);
-                // Синхронизируем absolute_raw с обрезанным значением,
-                // чтобы при вращении энкодера не было "холостого хода"
-                absolute_raw = (logical_duty * 4) as i32;
-            } else {
-                logical_duty = logical_duty.clamp(0, 1001);
-            }
-
+            // ВОЗВРАЩАЕМ КАК БЫЛО: Напряжение (ШИМ1) может гулять от 0 до 1001
+            let logical_duty = (absolute_raw / 4) as u32;
             let hardware_duty = ((logical_duty as u64 * max_duty as u64) / 1001) as u32;
 
             pwm.ch1().set_duty_cycle(hardware_duty);
@@ -103,10 +92,21 @@ pub async fn encoder_task(
             last_duty_change_at = embassy_time::Instant::now();
             if current_locked {
                 current_locked = false;
-                crate::PWM2_ACTUAL.store(950, Ordering::Relaxed); // Отпускаем на 95%
-                let pwm2_hw = ((950_u64 * max_duty as u64) / 1000) as u32;
+
+                // ПРАВИЛЬНОЕ МЕСТО ДЛЯ ЛИМИТА: ограничиваем аппаратный ШИМ2 (Ток)
+                let max_pwm2 = if crate::LIMIT_10A_EN.load(Ordering::Relaxed) {
+                    333
+                } else {
+                    950
+                };
+
+                crate::PWM2_ACTUAL.store(max_pwm2, Ordering::Relaxed);
+                let pwm2_hw = ((max_pwm2 as u64 * max_duty as u64) / 1000) as u32;
                 pwm.ch2().set_duty_cycle(pwm2_hw);
-                info!("Ограничение тока снято (95%) для регулировки напряжения");
+                info!(
+                    "Ограничение тока снято (лимит: {}) для регулировки напряжения",
+                    max_pwm2
+                );
             }
 
             info!(
@@ -126,23 +126,36 @@ pub async fn encoder_task(
         // 5. --- АВТОМАТИЧЕСКАЯ ФИКСАЦИЯ ТОКА И АВТО-РЕЖИМ ---
         let auto_mode = crate::AUTO_MODE.load(Ordering::Relaxed);
 
+        // Определяем абсолютный максимум для ШИМ2 в зависимости от тумблера на экране
+        let max_pwm2 = if crate::LIMIT_10A_EN.load(Ordering::Relaxed) {
+            333
+        } else {
+            950
+        };
+
         if auto_mode && !last_auto_mode {
             // Включили авто-режим (удержание потенциала)
-            let pwm2_limit = 333; // 10 Ампер защиты
+            let pwm2_limit = max_pwm2; // Применяем наш лимит
             crate::PWM2_ACTUAL.store(pwm2_limit, Ordering::Relaxed);
             let pwm2_hw = ((pwm2_limit as u64 * max_duty as u64) / 1000) as u32;
             pwm.ch2().set_duty_cycle(pwm2_hw);
-            info!("Авто-режим: Ограничение тока жестко установлено на 10А");
+            info!(
+                "Авто-режим: Ограничение тока жестко установлено на {}",
+                pwm2_limit
+            );
             current_locked = true;
         } else if !auto_mode && last_auto_mode {
             // Выключили авто-режим - отпускаем ток для ручной настройки
             last_duty_change_at = embassy_time::Instant::now();
             current_locked = false;
-            let pwm2_limit = 950;
+            let pwm2_limit = max_pwm2;
             crate::PWM2_ACTUAL.store(pwm2_limit, Ordering::Relaxed);
             let pwm2_hw = ((pwm2_limit as u64 * max_duty as u64) / 1000) as u32;
             pwm.ch2().set_duty_cycle(pwm2_hw);
-            info!("Выход из авто-режима: Ограничение тока снято (95%)");
+            info!(
+                "Выход из авто-режима: Ограничение тока снято ({})",
+                pwm2_limit
+            );
         }
         last_auto_mode = auto_mode;
 
@@ -158,7 +171,7 @@ pub async fn encoder_task(
             let limit_amps = (current_amps * 1.1) + 0.5;
 
             // Перевод в ШИМ (1000 ШИМ = 30А -> 33.33 ШИМ на 1А)
-            let limit_pwm = ((limit_amps * 33.33) as u32).clamp(0, 950);
+            let limit_pwm = ((limit_amps * 33.33) as u32).clamp(0, max_pwm2);
 
             crate::PWM2_ACTUAL.store(limit_pwm, Ordering::Relaxed);
             let pwm2_hw = ((limit_pwm as u64 * max_duty as u64) / 1000) as u32;
@@ -170,8 +183,7 @@ pub async fn encoder_task(
                 limit_pwm
             );
 
-            // Сохраняем новые настройки во флеш (Это гарантирует сохранение
-            // даже команд с сервера, минуя спам промежуточных шагов доводчика!)
+            // Сохраняем новые настройки во флеш
             crate::SAVE_FLASH_REQUEST.store(true, Ordering::Relaxed);
         }
     }
@@ -300,13 +312,9 @@ pub async fn auto_regulation_task() {
             current_pwm -= step; // Перестарались, нужно убавить
         }
 
-        let max_auto_pwm = if crate::LIMIT_10A_EN.load(Ordering::Relaxed) {
-            333 // Ограничиваем возможности авто-режима 10 Амперами
-        } else {
-            1001 // Полная мощность
-        };
-
-        current_pwm = current_pwm.clamp(0, max_auto_pwm);
+        // ВОЗВРАЩАЕМ 1001! Напряжение может быть максимальным.
+        // Ток не превысит лимит, так как мы его аппаратно ограничили через PWM2.
+        current_pwm = current_pwm.clamp(0, 1001);
 
         // Отправляем новое значение ШИМ со скрытым битом, чтобы сберечь флеш-память!
         let _ = crate::PWM_CHANNEL.try_send((current_pwm as u32) | (1 << 31));

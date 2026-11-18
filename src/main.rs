@@ -84,9 +84,11 @@ pub static TELEMETRY_PERIOD_SECS: AtomicU32 = AtomicU32::new(60);
 pub static AUTO_MODE: AtomicBool = AtomicBool::new(false);
 pub static AUTO_TARGET_MV: AtomicI32 = AtomicI32::new(0);
 
-pub static LIMIT_10A_EN: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-pub static V_I_MODE_EN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+pub static LIMIT_10A_EN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+pub static V_I_MODE_EN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+pub static POLARIZATION_POTENTIAL_MV: core::sync::atomic::AtomicI32 =
+    core::sync::atomic::AtomicI32::new(0);
 
 // ------------------------------------------------
 
@@ -139,6 +141,7 @@ pub struct SavedConfig {
     pub auto_target_mv: i32, //
     pub limit_10a: bool,
     pub v_i_mode: bool,
+    pub pol_potential_mv: i32,
 }
 
 const MAGIC_WORD: u32 = 0xAA55AA55;
@@ -323,32 +326,47 @@ async fn led_manager(mut led_ext: Output<'static>, mut led_batt: Output<'static>
     }
 }
 
-//задача изменения кВтч и ч раз в час и запрос на запись во флэш
+//задача изменения кВтч и ч раз в час и измерение поляризационного потенциала
+// и запрос на запись во флэш
 #[embassy_executor::task]
 pub async fn stats_task() {
     loop {
-        // Спим 1 час
         Timer::after(embassy_time::Duration::from_secs(3600)).await;
+        info!("Ежечасный замер: Отключение станции на 4 сек...");
 
+        // 1. ЗАПОМИНАЕМ ТЕКУЩИЙ ШИМ И РЕЖИМ ИЗ ОПЕРАТИВНОЙ ПАМЯТИ
+        let saved_pwm = crate::PWM1_ACTUAL.load(Ordering::Relaxed);
+        let was_auto = crate::AUTO_MODE.load(Ordering::Relaxed);
+
+        crate::AUTO_MODE.store(false, Ordering::Relaxed);
+        let _ = crate::PWM_CHANNEL.try_send(0 | (1 << 31));
+
+        // 2. Ждем 4 секунды (деполяризация трубы)
+        Timer::after(embassy_time::Duration::from_secs(4)).await;
+
+        // 3. Замер
+        let pol_mv = crate::P1_ACTUAL_MV.load(Ordering::Relaxed).abs();
+        info!("Ежечасный замер: Защитный потенциал = {} мВ", pol_mv);
+        crate::POLARIZATION_POTENTIAL_MV.store(pol_mv, Ordering::Relaxed);
+
+        // 4. ВКЛЮЧАЕМ СТАНЦИЮ, ИСПОЛЬЗУЯ ЗАПОМНЕННЫЙ ШИМ
+        let _ = crate::PWM_CHANNEL.try_send(saved_pwm | (1 << 31));
+        crate::AUTO_MODE.store(was_auto, Ordering::Relaxed);
+
+        Timer::after(embassy_time::Duration::from_millis(500)).await;
+        crate::FORCE_TELEMETRY_UPDATE.store(true, Ordering::Relaxed);
+
+        // 5. Расчет энергии и сохранение
         let u_mv = crate::U1_ACTUAL_MV.load(Ordering::Relaxed);
         let i_mv = crate::I1_ACTUAL_MV.load(Ordering::Relaxed);
-
         let u_v = (u_mv as f32) / 1000.0;
         let i_v = (i_mv as f32) / 1000.0;
-
-        // Энергия за час: (U * I) / 1000 в кВт*ч
         let added_kwh = (u_v * i_v) / 1000.0;
 
-        // Читаем, прибавляем, сохраняем обратно
-        let current_bits = ENERGY_KWH.load(Ordering::Relaxed);
-        let current_energy = f32::from_bits(current_bits);
-        let new_energy = current_energy + added_kwh;
-        ENERGY_KWH.store(new_energy.to_bits(), Ordering::Relaxed);
-
-        // Инкремент часов
+        let current_energy = f32::from_bits(ENERGY_KWH.load(Ordering::Relaxed));
+        ENERGY_KWH.store((current_energy + added_kwh).to_bits(), Ordering::Relaxed);
         HOURS_WORK.fetch_add(1, Ordering::Relaxed);
 
-        // Даем сигнал менеджеру памяти записать данные во флеш
         SAVE_FLASH_REQUEST.store(true, Ordering::Relaxed);
     }
 }
@@ -396,10 +414,11 @@ pub async fn flash_manager_task() {
                 auto_target_mv: crate::AUTO_TARGET_MV.load(Ordering::Relaxed),
                 limit_10a: crate::LIMIT_10A_EN.load(Ordering::Relaxed),
                 v_i_mode: crate::V_I_MODE_EN.load(Ordering::Relaxed),
+                pol_potential_mv: crate::POLARIZATION_POTENTIAL_MV.load(Ordering::Relaxed),
             };
 
             // Готовим выровненный буфер (10 слов u32)
-            let mut write_buf = [0xFFFF_FFFFu32; 10];
+            let mut write_buf = [0xFFFF_FFFFu32; 11];
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     &config as *const _ as *const u8,
@@ -417,11 +436,14 @@ pub async fn flash_manager_task() {
                 let flash_sr = 0x40023C0C as *mut u32;
                 let flash_cr = 0x40023C10 as *mut u32;
 
+                //Сброс аппаратных ошибок
+                core::ptr::write_volatile(flash_sr, 0x0000FFFF);
+
                 // --- 1. ИЩЕМ СВОБОДНУЮ ЯЧЕЙКУ ---
                 let flash_base = flash_addr as *const SavedConfig;
                 let mut need_erase = false;
 
-                for i in 0..3270 {
+                for i in 0..2970 {
                     let cfg_ptr = flash_base.add(i);
                     let magic_val = core::ptr::read_volatile(cfg_ptr as *const u32);
 
@@ -429,7 +451,7 @@ pub async fn flash_manager_task() {
                         target_index = i;
                         break;
                     }
-                    if i == 3269 {
+                    if i == 2969 {
                         need_erase = true; // Сектор забит до отказа
                     }
                 }
@@ -467,7 +489,7 @@ pub async fn flash_manager_task() {
                 // Вычисляем адрес для записи (смещаемся на target_index структур по 40 байт)
                 let write_ptr = (flash_addr as *mut SavedConfig).add(target_index) as *mut u32;
 
-                for i in 0..10 {
+                for i in 0..11 {
                     core::ptr::write_volatile(write_ptr.add(i), write_buf[i]);
                     while (core::ptr::read_volatile(flash_sr) & (1 << 16)) != 0 {}
                 }
@@ -531,8 +553,8 @@ async fn main(spawner: Spawner) {
     let flash_base = 0x080E_0000 as *const SavedConfig;
     let mut latest_config: Option<SavedConfig> = None;
 
-    // Ищем самую свежую запись (Сектор 11 вмещает 3276 структур по 40 байт)
-    for i in 0..3270 {
+    // Ищем самую свежую запись (Сектор 11 теперь вмещает 2978 структур по 44 байта)
+    for i in 0..2970 {
         let config = unsafe { &*flash_base.add(i) };
         if config.magic == MAGIC_WORD {
             latest_config = Some(*config); // Запоминаем валидную
@@ -565,6 +587,8 @@ async fn main(spawner: Spawner) {
         }
         crate::LIMIT_10A_EN.store(saved_config.limit_10a, Ordering::Relaxed);
         crate::V_I_MODE_EN.store(saved_config.v_i_mode, Ordering::Relaxed);
+
+        crate::POLARIZATION_POTENTIAL_MV.store(saved_config.pol_potential_mv, Ordering::Relaxed);
     } else {
         info!("Флеш-память пуста или повреждена. Применяем настройки по умолчанию.");
         // Значения по умолчанию уже заданы при объявлении (PWM1=0, PWM2=333, GSM=true, etc.)

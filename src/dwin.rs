@@ -330,6 +330,14 @@ pub async fn dwin_task(
             dwin_write_int16(&mut tx, 0x5038, limit_val).await;
             dwin_write_int16(&mut tx, 0x5039, vi_mode_val).await;
 
+            // ... рядом с отправкой энергии или часов (например, строка ~200) ...
+
+            let pol_pot_mv = crate::POLARIZATION_POTENTIAL_MV.load(Ordering::Relaxed);
+            let pol_pot_v = (pol_pot_mv as f32) / 1000.0;
+
+            // Отправляем защитный потенциал как Float
+            dwin_write_float(&mut tx, 0x5010, pol_pot_v).await;
+
             // Если для Bluetooth есть свой адрес в DGUS (например, 0x5032), добавь:
             // dwin_write_int16(&mut tx, 0x5032, 1).await;
         }

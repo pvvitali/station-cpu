@@ -7,6 +7,13 @@ use embassy_time::{Duration, Timer, with_timeout};
 use embedded_io_async::Write;
 use heapless::String;
 
+use core::cell::RefCell;
+use cortex_m::peripheral::SCB;
+use embassy_boot_stm32::{AlignedBuffer, BlockingFirmwareUpdater, FirmwareUpdaterConfig};
+use embassy_stm32::flash::{Flash, WRITE_SIZE};
+use embassy_sync::blocking_mutex::Mutex;
+use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+
 bind_interrupts!(struct Irqs {
     USART1 => usart::InterruptHandler<peripherals::USART1>;
     DMA2_STREAM2 => embassy_stm32::dma::InterruptHandler<peripherals::DMA2_CH2>;
@@ -42,7 +49,7 @@ macro_rules! send_at {
         // Вычитываем буфер досуха (пока не наступит таймаут)
         while let Ok(_) = with_timeout(
             Duration::from_millis(50),
-            $uart.read_until_idle(&mut $rx_buf),
+            $uart.read_until_idle(&mut $rx_buf[..]),
         )
         .await
         {}
@@ -56,7 +63,7 @@ macro_rules! send_at {
 
                 if let Ok(Ok(len)) = with_timeout(
                     Duration::from_millis(remaining),
-                    $uart.read_until_idle(&mut $rx_buf),
+                    $uart.read_until_idle(&mut $rx_buf[..]),
                 )
                 .await
                 {
@@ -191,6 +198,183 @@ macro_rules! send_server_ok {
     }};
 }
 
+const OTA_URL: &str = "http://sczprog.cloud/update.bin";
+const MAX_FW_SIZE: usize = 256 * 1024; // Максимум = размер раздела ACTIVE (256 КБ)
+const CHUNK_SIZE: usize = 512;
+
+async fn download_and_flash_ota<DFU, STATE>(
+    uart: &mut Uart<'static, embassy_stm32::mode::Async>,
+    rx_buf: &mut [u8; 1024],
+    updater: &mut BlockingFirmwareUpdater<'_, DFU, STATE>,
+) -> Result<(), &'static str>
+where
+    DFU: embedded_storage::nor_flash::NorFlash,
+    STATE: embedded_storage::nor_flash::NorFlash,
+{
+    info!("OTA: Старт обновления с {}", OTA_URL);
+
+    // 1. Сброс старой HTTP-сессии и инициализация
+    let _ = send_at!(uart, rx_buf, b"AT+HTTPTERM\r\n", "OK", 1000);
+    if !send_at!(uart, rx_buf, b"AT+HTTPINIT\r\n", "OK", 3000) {
+        return Err("HTTPINIT failed");
+    }
+
+    let mut url_cmd = heapless::String::<128>::new();
+    core::fmt::write(
+        &mut url_cmd,
+        format_args!("AT+HTTPPARA=\"URL\",\"{}\"\r\n", OTA_URL),
+    )
+    .unwrap();
+    if !send_at!(uart, rx_buf, url_cmd.as_bytes(), "OK", 3000) {
+        let _ = send_at!(uart, rx_buf, b"AT+HTTPTERM\r\n", "OK", 1000);
+        return Err("HTTPPARA URL failed");
+    }
+
+    // 2. GET-запрос: модем скачивает файл в свою оперативную память
+    info!("OTA: Запрос файла (AT+HTTPACTION=0)...");
+    while let Ok(_) = with_timeout(Duration::from_millis(50), uart.read_until_idle(rx_buf)).await {}
+    if uart.write_all(b"AT+HTTPACTION=0\r\n").await.is_err() {
+        return Err("UART write HTTPACTION failed");
+    }
+
+    let mut total_size: usize = 0;
+    let start = embassy_time::Instant::now();
+    while start.elapsed().as_secs() < 120 {
+        if let Ok(Ok(len)) =
+            with_timeout(Duration::from_secs(5), uart.read_until_idle(rx_buf)).await
+        {
+            if let Ok(resp) = str::from_utf8(&rx_buf[..len]) {
+                // Ожидаем: +HTTPACTION: 0,200,<размер>
+                if let Some(idx) = resp.find("+HTTPACTION:") {
+                    let tail = &resp[idx + 12..];
+                    let parts: heapless::Vec<&str, 4> = tail.trim().split(',').collect();
+                    if parts.len() >= 3 {
+                        let status = parts[1].trim().parse::<u16>().unwrap_or(0);
+                        let size_str = parts[2].split_whitespace().next().unwrap_or("0");
+                        let size = size_str.parse::<usize>().unwrap_or(0);
+                        drop(parts); // <-- Освобождаем rx_buf перед возможным вызовом send_at!
+                        if status == 200 && size > 0 {
+                            total_size = size;
+                            break;
+                        } else {
+                            error!("OTA: HTTP ошибка, статус={}, размер={}", status, size);
+                            let _ = send_at!(uart, rx_buf, b"AT+HTTPTERM\r\n", "OK", 1000);
+                            return Err("HTTP status != 200");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if total_size == 0 || total_size > MAX_FW_SIZE {
+        error!("OTA: Некорректный размер файла: {} байт", total_size);
+        let _ = send_at!(uart, rx_buf, b"AT+HTTPTERM\r\n", "OK", 1000);
+        return Err("Invalid firmware size");
+    }
+    info!(
+        "OTA: Файл скачан в модем ({} байт). Начинаем запись в DFU...",
+        total_size
+    );
+
+    // 3. Постраничное чтение из модема и запись во флеш STM32
+    let mut offset: usize = 0;
+    let mut write_buf = [0xFFu8; CHUNK_SIZE];
+
+    while offset < total_size {
+        let to_read = core::cmp::min(CHUNK_SIZE, total_size - offset);
+
+        // Очищаем мусор в UART
+        while let Ok(_) =
+            with_timeout(Duration::from_millis(20), uart.read_until_idle(rx_buf)).await
+        {}
+
+        let mut read_cmd = heapless::String::<48>::new();
+        core::fmt::write(
+            &mut read_cmd,
+            format_args!("AT+HTTPREAD={},{}\r\n", offset, to_read),
+        )
+        .unwrap();
+        if uart.write_all(read_cmd.as_bytes()).await.is_err() {
+            return Err("UART write HTTPREAD failed");
+        }
+
+        // Собираем ответ модема в rx_buf, пока не получим заголовок + все `to_read` байт
+        let mut total_rx = 0usize;
+        let mut data_start: Option<usize> = None;
+        let chunk_start = embassy_time::Instant::now();
+
+        while chunk_start.elapsed().as_secs() < 10 {
+            if total_rx >= rx_buf.len() {
+                break;
+            }
+            if let Ok(Ok(n)) = with_timeout(
+                Duration::from_millis(500),
+                uart.read_until_idle(&mut rx_buf[total_rx..]),
+            )
+            .await
+            {
+                total_rx += n;
+
+                // Ищем заголовок "+HTTPREAD:" и перенос строки '\n' сразу после него
+                if data_start.is_none() {
+                    if let Some(hdr_pos) = rx_buf[..total_rx]
+                        .windows(10)
+                        .position(|w| w == b"+HTTPREAD:")
+                    {
+                        if let Some(nl_rel) =
+                            rx_buf[hdr_pos..total_rx].iter().position(|&b| b == b'\n')
+                        {
+                            data_start = Some(hdr_pos + nl_rel + 1);
+                        }
+                    }
+                }
+
+                if let Some(ds) = data_start {
+                    if total_rx >= ds + to_read {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let ds = match data_start {
+            Some(pos) if total_rx >= pos + to_read => pos,
+            _ => {
+                error!("OTA: Таймаут чтения блока на смещении {}", offset);
+                let _ = send_at!(uart, rx_buf, b"AT+HTTPTERM\r\n", "OK", 1000);
+                return Err("HTTPREAD timeout");
+            }
+        };
+
+        // Копируем данные и добиваем последний блок до кратности 4 байтам (WRITE_SIZE)
+        write_buf.fill(0xFF);
+        write_buf[..to_read].copy_from_slice(&rx_buf[ds..ds + to_read]);
+        let aligned_len = (to_read + WRITE_SIZE - 1) & !(WRITE_SIZE - 1);
+
+        if updater
+            .write_firmware(offset, &write_buf[..aligned_len])
+            .is_err()
+        {
+            error!("OTA: Ошибка записи во флеш на смещении {}", offset);
+            let _ = send_at!(uart, rx_buf, b"AT+HTTPTERM\r\n", "OK", 1000);
+            return Err("Flash write failed");
+        }
+
+        offset += to_read;
+        if offset % (16 * 1024) == 0 || offset == total_size {
+            info!("OTA: Записано {} / {} байт", offset, total_size);
+        }
+    }
+
+    let _ = send_at!(uart, rx_buf, b"AT+HTTPTERM\r\n", "OK", 1000);
+
+    // 4. Ставим флаг для загрузчика
+    updater.mark_updated().map_err(|_| "mark_updated failed")?;
+    info!("OTA: Прошивка записана и помечена! Перезагрузка...");
+    Ok(())
+}
+
 #[embassy_executor::task]
 pub async fn gsm_task(
     usart1: Peri<'static, peripherals::USART1>,
@@ -203,12 +387,27 @@ pub async fn gsm_task(
     mut dtr: Output<'static>,
     status: Input<'static>,
     _ring: Input<'static>,
+    flash_peri: Peri<'static, peripherals::FLASH>,
 ) {
     let mut config = Config::default();
     config.baudrate = 115200;
 
     let mut uart = Uart::new(usart1, rx_pin, tx_pin, tx_dma, rx_dma, Irqs, config).unwrap();
     let mut rx_buf = [0u8; 1024];
+
+    let layout = Flash::new_blocking(flash_peri).into_blocking_regions();
+    let state_flash = Mutex::<NoopRawMutex, _>::new(RefCell::new(layout.bank1_region2));
+    let dfu_flash = Mutex::<NoopRawMutex, _>::new(RefCell::new(layout.bank1_region3));
+
+    let fw_config = FirmwareUpdaterConfig::from_linkerfile_blocking(&dfu_flash, &state_flash);
+    let mut magic = AlignedBuffer([0; WRITE_SIZE]);
+    let mut updater = BlockingFirmwareUpdater::new(fw_config, &mut magic.0);
+
+    // Подтверждаем загрузчику, что текущая прошивка успешно стартовала
+    match updater.mark_booted() {
+        Ok(_) => info!("OTA: Текущая прошивка подтверждена (mark_booted OK)."),
+        Err(_) => error!("OTA: Ошибка mark_booted!"),
+    }
 
     info!("GSM: Запуск...");
     pwrkey.set_low();
@@ -480,8 +679,10 @@ pub async fn gsm_task(
                 let temp_x10 = crate::TEMP_C_X10.load(core::sync::atomic::Ordering::Relaxed);
                 let csq_raw = crate::GSM_SIGNAL.load(core::sync::atomic::Ordering::Relaxed);
 
-                // 0 - HardwareId
-                let id_str = "10000602";
+                // 0 - HardwareId (теперь берем из памяти)
+                let id_val = crate::STATION_ID.load(core::sync::atomic::Ordering::Relaxed);
+                let mut id_str = heapless::String::<16>::new();
+                core::fmt::write(&mut id_str, format_args!("{}", id_val)).unwrap();
 
                 // 1 - Выходной ток * 10 (мА / 100) -> 30.2A = 302
                 let i_str = round_div(i1_mv, 100);
@@ -750,7 +951,7 @@ pub async fn gsm_task(
                                             let mut restore_pwm = 0;
                                             let flash_base =
                                                 0x080E_0000 as *const crate::SavedConfig;
-                                            for i in 0..2970 {
+                                            for i in 0..2720 {
                                                 let config = unsafe { &*flash_base.add(i) };
                                                 if config.magic == 0xAA55AA55 {
                                                     restore_pwm = config.pwm1_logical;
@@ -829,13 +1030,57 @@ pub async fn gsm_task(
                                             Timer::after_millis(200).await;
                                             break;
                                         }
-                                        ServerCommand::Unknown => {}
-                                        _ => {
+                                        ServerCommand::UpdateFlash(tx_id) => {
                                             info!(
-                                                "Получена команда: {:?}",
-                                                defmt::Debug2Format(&cmd)
+                                                "GSM: Команда Обновления прошивки (tx: {})",
+                                                tx_id.as_str()
                                             );
+                                            send_server_ok!(uart, rx_buf, "15", tx_id.as_str());
+                                            Timer::after_millis(500).await;
+
+                                            // Закрываем TCP и ставим на паузу запись настроек во флеш
+                                            let _ = send_at!(
+                                                uart,
+                                                rx_buf,
+                                                b"AT+CIPCLOSE=0\r\n",
+                                                "OK",
+                                                2000
+                                            );
+                                            crate::OTA_IN_PROGRESS
+                                                .store(true, core::sync::atomic::Ordering::Relaxed);
+
+                                            match download_and_flash_ota(
+                                                &mut uart,
+                                                &mut rx_buf,
+                                                &mut updater,
+                                            )
+                                            .await
+                                            {
+                                                Ok(_) => {
+                                                    Timer::after_millis(500).await;
+                                                    SCB::sys_reset(); // Уходим в перезагрузку -> bootloader обновит прошивку
+                                                }
+                                                Err(e) => {
+                                                    error!("OTA: Ошибка обновления: {}", e);
+                                                    crate::OTA_IN_PROGRESS.store(
+                                                        false,
+                                                        core::sync::atomic::Ordering::Relaxed,
+                                                    );
+                                                    crate::GSM_OK.store(
+                                                        false,
+                                                        core::sync::atomic::Ordering::Relaxed,
+                                                    );
+                                                    break 'telemetry_loop; // Переподключаемся к TCP-серверу
+                                                }
+                                            }
                                         }
+                                        ServerCommand::Unknown => {} //
+                                                                     // _ => {
+                                                                     //     info!(
+                                                                     //         "Получена команда: {:?}",
+                                                                     //         defmt::Debug2Format(&cmd)
+                                                                     //     );
+                                                                     // }
                                     }
                                 }
                             }

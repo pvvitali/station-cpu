@@ -60,6 +60,8 @@ async fn dwin_write_int32<W: embedded_io_async::Write>(uart: &mut W, addr: u16, 
     let _ = uart.write_all(&buf).await;
 }
 
+static mut PENDING_ID: u32 = 0;
+
 #[embassy_executor::task]
 pub async fn dwin_task(
     usart6: Peri<'static, peripherals::USART6>,
@@ -127,11 +129,49 @@ pub async fn dwin_task(
                                                 crate::FORCE_TELEMETRY_UPDATE
                                                     .store(true, Ordering::Relaxed);
                                             }
+                                        } else if addr == 0x5044 && data_len == 4 && pkt.len() >= 11
+                                        {
+                                            // 1. ПОЛУЧИЛИ НОВЫЙ ID С ЭКРАНА
+                                            let new_id = ((pkt[7] as u32) << 24)
+                                                | ((pkt[8] as u32) << 16)
+                                                | ((pkt[9] as u32) << 8)
+                                                | (pkt[10] as u32);
+                                            unsafe {
+                                                PENDING_ID = new_id;
+                                            }
+                                            info!(
+                                                "DWIN: Введен новый ID ({}), ожидание пароля...",
+                                                new_id
+                                            );
                                         } else if data_len == 2 && pkt.len() >= 9 {
                                             // --- СТАНДАРТНАЯ ОБРАБОТКА INT16 (2 байта) ---
                                             let data = ((pkt[7] as u16) << 8) | (pkt[8] as u16);
 
                                             match addr {
+                                                0x5048 => {
+                                                    // 2. ПОЛУЧИЛИ ПАРОЛЬ
+                                                    if data == 543 {
+                                                        let new_id = unsafe { PENDING_ID };
+                                                        if new_id > 10000000 {
+                                                            crate::STATION_ID
+                                                                .store(new_id, Ordering::Relaxed);
+                                                            crate::SAVE_FLASH_REQUEST
+                                                                .store(true, Ordering::Relaxed);
+                                                            info!(
+                                                                "DWIN: Пароль верный! Станция получила ID: {}",
+                                                                new_id
+                                                            );
+                                                            unsafe {
+                                                                PENDING_ID = 0;
+                                                            } // Очищаем временный буфер
+                                                        }
+                                                    } else {
+                                                        info!(
+                                                            "DWIN: Неверный пароль ({})! Отказ в смене ID.",
+                                                            data
+                                                        );
+                                                    }
+                                                }
                                                 0x5012 => {
                                                     info!("-> Изменение ШИМ: {}", data);
                                                     if crate::AUTO_MODE.load(Ordering::Relaxed) {
@@ -180,47 +220,6 @@ pub async fn dwin_task(
                                         }
                                     }
 
-                                    // if pkt_len >= 6 && pkt[3] == 0x83 {
-                                    //     let addr = ((pkt[4] as u16) << 8) | (pkt[5] as u16);
-                                    //     let data = ((pkt[7] as u16) << 8) | (pkt[8] as u16);
-
-                                    //     match addr {
-                                    //         0x5012 => {
-                                    //             info!("-> Изменение ШИМ: {}", data);
-
-                                    //             // --- ОТКЛЮЧАЕМ АВТО-РЕЖИМ ПРИ РУЧНОМ УПРАВЛЕНИИ С ЭКРАНА ---
-                                    //             if crate::AUTO_MODE.load(Ordering::Relaxed) {
-                                    //                 crate::AUTO_MODE
-                                    //                     .store(false, Ordering::Relaxed);
-                                    //                 info!(
-                                    //                     "Ручное вмешательство (DWIN): Авто-режим отключен!"
-                                    //                 );
-                                    //                 // Сохранение во флеш-память автоматически подхватится
-                                    //                 // через 10-секундный таймер в задаче энкодера.
-                                    //             }
-
-                                    //             // Отправляем значение от экрана в канал управления ШИМ
-                                    //             let _ = crate::PWM_CHANNEL.try_send(data as u32);
-                                    //         }
-                                    //         0x5017 => info!("-> Аккумулятор: {}", data),
-                                    //         // Внутри rx_fut, где парсится адрес 0x5030
-                                    //         0x5030 => {
-                                    //             info!("-> GSM Переключатель (DWIN): {}", data);
-                                    //             crate::GSM_ON.store(data > 0, Ordering::Relaxed);
-                                    //             // При изменении настроек сразу запрашиваем сохранение
-                                    //             crate::SAVE_FLASH_REQUEST
-                                    //                 .store(true, Ordering::Relaxed);
-                                    //         }
-                                    //         //// Если добавишь 0x5014 для ШИМ2 (тока):
-                                    //         // 0x5014 => {
-                                    //         //     crate::PWM2_ACTUAL
-                                    //         //         .store(data as u32, Ordering::Relaxed);
-                                    //         //     crate::SAVE_FLASH_REQUEST
-                                    //         //         .store(true, Ordering::Relaxed);
-                                    //         // }
-                                    //         _ => {}
-                                    //     }
-                                    // }
                                     i += full_pkt_len;
                                     continue;
                                 }
@@ -338,8 +337,11 @@ pub async fn dwin_task(
             // Отправляем защитный потенциал как Float
             dwin_write_float(&mut tx, 0x5010, pol_pot_v).await;
 
-            // Если для Bluetooth есть свой адрес в DGUS (например, 0x5032), добавь:
-            // dwin_write_int16(&mut tx, 0x5032, 1).await;
+            let station_id = crate::STATION_ID.load(Ordering::Relaxed);
+            dwin_write_int32(&mut tx, 0x5040, station_id).await;
+
+            // Если для Bluetooth есть свой адрес в DGUS (например, 0x5019)
+            dwin_write_int16(&mut tx, 0x5019, 1).await;
         }
     };
 

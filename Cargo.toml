@@ -16,9 +16,12 @@ panic-probe = { version = "1.0.0", features = ["print-defmt"] }
 # Экосистема Embassy (обновленные фичи)
 embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread", "defmt"] }
 embassy-time = { version = "0.5.1", features = ["defmt", "defmt-timestamp-uptime"] }
-embassy-stm32 = { version = "0.6.0", features = ["stm32f412rg", "memory-x", "time-driver-any", "exti", "defmt", "unstable-pac"] }
+embassy-stm32 = { version = "0.6.0", features = ["stm32f412rg", "time-driver-any", "exti", "defmt", "unstable-pac"] }
+#  "memory-x", 
 embassy-sync = { version = "0.8.0", features = ["defmt"] } # <-- ДОБАВЛЕНО для Channel и Mutex
 embassy-futures = "0.1"
+embassy-boot-stm32 = { version = "0.8.0", features = ["defmt"] }
+embedded-storage = "0.3"
 
 # --- НОВЫЕ ЗАВИСИМОСТИ ---
 
@@ -42,13 +45,20 @@ embedded-io-async = { version = "0.7.0", default-features = false }
 #[profile.dev.build-override]
 #opt-level = "s"
 
+#[profile.release]
+#opt-level = "s"       # Оптимизация по размеру ("z" для еще более агрессивного сжатия, 3 - для максимальной скорости)
+#lto = true            # Link Time Optimization: компилятор анализирует весь код целиком и вырезает всё неиспользуемое
+#codegen-units = 1     # Замедляет компиляцию, но дает компилятору возможность лучше оптимизировать код
+#debug = false         # Отключает генерацию отладочных символов
+#strip = false         # Вырезает символы и отладочную информацию из итогового бинарника
+#panic = "abort"       # Мгновенная остановка при панике (экономит память, убирая код "раскрутки" стека)
+
 [profile.release]
-opt-level = "s"       # Оптимизация по размеру ("z" для еще более агрессивного сжатия, 3 - для максимальной скорости)
-lto = true            # Link Time Optimization: компилятор анализирует весь код целиком и вырезает всё неиспользуемое
-codegen-units = 1     # Замедляет компиляцию, но дает компилятору возможность лучше оптимизировать код
-debug = false         # Отключает генерацию отладочных символов
-strip = false         # Вырезает символы и отладочную информацию из итогового бинарника
-panic = "abort"       # Мгновенная остановка при панике (экономит память, убирая код "раскрутки" стека)
+debug = 2         # Оставляет символы для defmt/RTT (НЕ увеличивает размер прошивки во флеше МК!)
+opt-level = "s"   # Оптимизация по размеру (можно "z" для минимального размера)
+#lto = true        # Оптимизация на этапе линковки
+lto = "thin"
 
 #cargo build --release
 #probe-rs run --chip STM32F412RG target\thumbv7em-none-eabihf\release\station-cpu
+#cargo run --release

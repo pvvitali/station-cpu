@@ -90,6 +90,9 @@ pub static V_I_MODE_EN: core::sync::atomic::AtomicBool = core::sync::atomic::Ato
 pub static POLARIZATION_POTENTIAL_MV: core::sync::atomic::AtomicI32 =
     core::sync::atomic::AtomicI32::new(0);
 
+// Глобальная переменная для ID (по умолчанию 10000000)
+pub static STATION_ID: AtomicU32 = AtomicU32::new(10000000);
+
 // ------------------------------------------------
 
 // --- ДОБАВЛЕННЫЙ КОД ДЛЯ ДОВОДЧИКА НАПРЯЖЕНИЯ ---
@@ -124,6 +127,8 @@ pub static SAVE_FLASH_REQUEST: AtomicBool = AtomicBool::new(false);
 
 // Таймер отложенного сохранения (в секундах), чтобы не "затирать" флеш при вращении энкодера
 pub static FLASH_SAVE_COUNTDOWN: AtomicU32 = AtomicU32::new(0);
+
+pub static OTA_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 //---------------------------------------
 
 // --- Структура для сохранения (с Магическим словом) ---
@@ -142,6 +147,7 @@ pub struct SavedConfig {
     pub limit_10a: bool,
     pub v_i_mode: bool,
     pub pol_potential_mv: i32,
+    pub station_id: u32,
 }
 
 const MAGIC_WORD: u32 = 0xAA55AA55;
@@ -391,7 +397,7 @@ pub async fn flash_manager_task() {
             }
         }
 
-        if SAVE_FLASH_REQUEST.load(Ordering::Relaxed) {
+        if SAVE_FLASH_REQUEST.load(Ordering::Relaxed) && !OTA_IN_PROGRESS.load(Ordering::Relaxed) {
             SAVE_FLASH_REQUEST.store(false, Ordering::Relaxed);
 
             let config = SavedConfig {
@@ -415,10 +421,11 @@ pub async fn flash_manager_task() {
                 limit_10a: crate::LIMIT_10A_EN.load(Ordering::Relaxed),
                 v_i_mode: crate::V_I_MODE_EN.load(Ordering::Relaxed),
                 pol_potential_mv: crate::POLARIZATION_POTENTIAL_MV.load(Ordering::Relaxed),
+                station_id: crate::STATION_ID.load(Ordering::Relaxed), // Записываем ID
             };
 
-            // Готовим выровненный буфер (10 слов u32)
-            let mut write_buf = [0xFFFF_FFFFu32; 11];
+            // Готовим выровненный буфер (12 слов u32)
+            let mut write_buf = [0xFFFF_FFFFu32; 12];
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     &config as *const _ as *const u8,
@@ -443,7 +450,8 @@ pub async fn flash_manager_task() {
                 let flash_base = flash_addr as *const SavedConfig;
                 let mut need_erase = false;
 
-                for i in 0..2970 {
+                // Ищем свободную ячейку (лимит 2720)
+                for i in 0..2720 {
                     let cfg_ptr = flash_base.add(i);
                     let magic_val = core::ptr::read_volatile(cfg_ptr as *const u32);
 
@@ -451,7 +459,7 @@ pub async fn flash_manager_task() {
                         target_index = i;
                         break;
                     }
-                    if i == 2969 {
+                    if i == 2719 {
                         need_erase = true; // Сектор забит до отказа
                     }
                 }
@@ -489,7 +497,7 @@ pub async fn flash_manager_task() {
                 // Вычисляем адрес для записи (смещаемся на target_index структур по 40 байт)
                 let write_ptr = (flash_addr as *mut SavedConfig).add(target_index) as *mut u32;
 
-                for i in 0..11 {
+                for i in 0..12 {
                     core::ptr::write_volatile(write_ptr.add(i), write_buf[i]);
                     while (core::ptr::read_volatile(flash_sr) & (1 << 16)) != 0 {}
                 }
@@ -554,7 +562,7 @@ async fn main(spawner: Spawner) {
     let mut latest_config: Option<SavedConfig> = None;
 
     // Ищем самую свежую запись (Сектор 11 теперь вмещает 2978 структур по 44 байта)
-    for i in 0..2970 {
+    for i in 0..2720 {
         let config = unsafe { &*flash_base.add(i) };
         if config.magic == MAGIC_WORD {
             latest_config = Some(*config); // Запоминаем валидную
@@ -589,6 +597,13 @@ async fn main(spawner: Spawner) {
         crate::V_I_MODE_EN.store(saved_config.v_i_mode, Ordering::Relaxed);
 
         crate::POLARIZATION_POTENTIAL_MV.store(saved_config.pol_potential_mv, Ordering::Relaxed);
+
+        // Читаем ID с защитой от "мусора" (только 8-значные числа)
+        let mut s_id = saved_config.station_id;
+        if s_id < 10000000 || s_id > 10900000 {
+            s_id = 10000000;
+        }
+        crate::STATION_ID.store(s_id, Ordering::Relaxed);
     } else {
         info!("Флеш-память пуста или повреждена. Применяем настройки по умолчанию.");
         // Значения по умолчанию уже заданы при объявлении (PWM1=0, PWM2=333, GSM=true, etc.)
@@ -787,7 +802,7 @@ async fn main(spawner: Spawner) {
     spawner.spawn(
         gsm::gsm_task(
             p.USART1, p.PA10, p.PA9, p.DMA2_CH2, p.DMA2_CH7, gsm_pwrkey, gsm_reset, gsm_dtr,
-            gsm_status, gsm_ring,
+            gsm_status, gsm_ring, p.FLASH,
         )
         .unwrap(),
     );

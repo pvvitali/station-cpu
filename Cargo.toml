@@ -3,6 +3,11 @@ name = "station-cpu"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["hw-v2"] # По умолчанию собираем под новую плату
+hw-v1 = []          # Старая плата (контроль по PG, пульсации OTG)
+hw-v2 = []          # Новая плата (IS_12V на PC14 + ENABLE_PMID на PC3)
+
 [dependencies]
 # Базовые библиотеки ARM
 cortex-m = { version = "0.7", features = ["inline-asm", "critical-section-single-core"] }

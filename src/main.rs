@@ -12,14 +12,19 @@ use defmt_rtt as _;
 use panic_probe as _;
 
 use embassy_executor::Spawner;
+use embassy_futures::select::{Either, select};
 use embassy_stm32::bind_interrupts;
 use embassy_stm32::exti::{self, ExtiInput};
 use embassy_stm32::gpio::{Input, Level, Output, Pull, Speed};
 use embassy_stm32::interrupt;
 use embassy_stm32::mode::Async;
 use embassy_time::{Duration, Timer, with_timeout}; // Добавляем импорт модуля прерываний
-// gsm
-//use embassy_stm32::gpio::{Input, Level, Output, Pull, Speed}; // Убедитесь, что импорты на месте
+
+#[cfg(feature = "hw-v1")]
+pub const HW_REV: &str = "HW_v1";
+
+#[cfg(feature = "hw-v2")]
+pub const HW_REV: &str = "HW_v2";
 
 //
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -170,10 +175,13 @@ mod gsm;
 bind_interrupts!(struct Irqs {
     EXTI0 => exti::InterruptHandler<interrupt::typelevel::EXTI0>;
     EXTI1 => exti::InterruptHandler<interrupt::typelevel::EXTI1>;
+    EXTI15_10 => exti::InterruptHandler<interrupt::typelevel::EXTI15_10>;
 });
 
+#[cfg(feature = "hw-v1")]
 #[embassy_executor::task]
 async fn monitor_power_good(mut pg: ExtiInput<'static, Async>, mut otg: Output<'static>) {
+    // ... старый код для v1 ...
     otg.set_low();
     Timer::after_millis(100).await;
 
@@ -238,6 +246,87 @@ async fn monitor_power_good(mut pg: ExtiInput<'static, Async>, mut otg: Output<'
     }
 }
 
+#[cfg(feature = "hw-v2")]
+#[embassy_executor::task]
+async fn monitor_power_good(
+    mut is_12v: ExtiInput<'static, Async>,
+    mut otg: Output<'static>,
+    mut enable_pmid: Output<'static>,
+) {
+    otg.set_low();
+    Timer::after_millis(50).await;
+
+    let mut is_battery_mode = if is_12v.is_high() {
+        enable_pmid.set_high();
+        POWER_SOURCE.store(false, Ordering::Relaxed);
+        POWER_STABLE.store(true, Ordering::Relaxed);
+        info!("[ПИТАНИЕ] СТАРТ: Внешнее напряжение 12В подключено! (IS_12V = 1)");
+        false
+    } else {
+        enable_pmid.set_low();
+        POWER_SOURCE.store(true, Ordering::Relaxed);
+        POWER_STABLE.store(false, Ordering::Relaxed); // Ставим АЦП на паузу
+        warn!("[ПИТАНИЕ] СТАРТ: Работаем от АКБ! 5V_PMID отключено (IS_12V = 0)");
+        true
+    };
+
+    loop {
+        if is_battery_mode {
+            // Ждём либо 5 минут (300 сек), либо мгновенного возврата 12В
+            match select(Timer::after_secs(300), is_12v.wait_for_high()).await {
+                Either::Second(_) => {
+                    Timer::after_millis(50).await; // Антидребезг
+                    if is_12v.is_high() {
+                        otg.set_low();
+                        enable_pmid.set_high();
+                        is_battery_mode = false;
+
+                        info!("[ПИТАНИЕ] Внешнее напряжение 12В восстановлено! 5V_PMID включено.");
+                        Timer::after_millis(250).await;
+                        POWER_SOURCE.store(false, Ordering::Relaxed);
+                        POWER_STABLE.store(true, Ordering::Relaxed);
+                        // перепроверить удаление crate::FORCE_TELEMETRY_UPDATE.store
+                        //crate::FORCE_TELEMETRY_UPDATE.store(true, Ordering::Relaxed);
+                    }
+                }
+                Either::First(_) => {
+                    // Прошло 5 минут: кратковременно подаём 5В для точного замера АЦП
+                    info!("[ПИТАНИЕ] Автономный замер (5 мин): включаем OTG и 5V_PMID...");
+                    otg.set_high();
+                    Timer::after_millis(50).await;
+                    enable_pmid.set_high();
+                    Timer::after_millis(250).await; // Стабилизация 5В и датчиков
+
+                    // Разрешаем АЦП сделать 1-2 свежих замера (цикл adc.rs = 300-350 мс)
+                    POWER_STABLE.store(true, Ordering::Relaxed);
+                    Timer::after_millis(700).await;
+                    POWER_STABLE.store(false, Ordering::Relaxed);
+
+                    // Сразу гасим 5В ДО того, как модем начнёт передачу
+                    enable_pmid.set_low();
+                    otg.set_low();
+                    info!("[ПИТАНИЕ] Замер завершён, 5V_PMID отключено. Будим GSM...");
+                    crate::FORCE_TELEMETRY_UPDATE.store(true, Ordering::Relaxed);
+                }
+            }
+        } else {
+            is_12v.wait_for_low().await;
+            Timer::after_millis(50).await; // Антидребезг
+
+            if is_12v.is_low() {
+                POWER_STABLE.store(false, Ordering::Relaxed); // Пауза АЦП на время сна
+                enable_pmid.set_low();
+                otg.set_low();
+                POWER_SOURCE.store(true, Ordering::Relaxed);
+                is_battery_mode = true;
+
+                warn!("[ПИТАНИЕ] Отключение 12В! Переход на АКБ, 5V_PMID отключено.");
+                crate::FORCE_TELEMETRY_UPDATE.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 // --- Задача 2: Мониторинг статуса зарядки (STAT) ---
 #[embassy_executor::task]
 async fn monitor_charge_status(mut stat: ExtiInput<'static, Async>) {
@@ -285,18 +374,24 @@ async fn monitor_charge_status(mut stat: ExtiInput<'static, Async>) {
     }
 }
 
-// --- Задача 3: Системная индикация (LED) ---
+// --- Задача 3: Системная индикация (LED PB2) ---
 #[embassy_executor::task]
 async fn blink_led(mut led: Output<'static>) {
     loop {
-        led.set_high();
-        Timer::after_millis(100).await;
-        led.set_low();
-        Timer::after_millis(100).await;
+        if POWER_SOURCE.load(Ordering::Relaxed) {
+            // На АКБ: гасим светодиод (индикацию берёт на себя PD2)
+            led.set_low();
+            Timer::after_millis(500).await;
+        } else {
+            led.set_high();
+            Timer::after_millis(100).await;
+            led.set_low();
+            Timer::after_millis(100).await;
+        }
     }
 }
 
-// --- Задача 3: Менеджер индикации ---
+// --- Задача 3: Менеджер индикации (PA15 и PD2) ---
 #[embassy_executor::task]
 async fn led_manager(mut led_ext: Output<'static>, mut led_batt: Output<'static>) {
     let mut blink_state = false;
@@ -307,10 +402,9 @@ async fn led_manager(mut led_ext: Output<'static>, mut led_batt: Output<'static>
 
         if !is_batt {
             // Внешнее питание 12В ЕСТЬ
-            led_ext.set_high(); // PA15 всегда горит
+            led_ext.set_high();
 
             if is_err {
-                // Ошибка АКБ: мигаем PD2
                 if blink_state {
                     led_batt.set_high();
                 } else {
@@ -319,15 +413,23 @@ async fn led_manager(mut led_ext: Output<'static>, mut led_batt: Output<'static>
                 blink_state = !blink_state;
                 Timer::after_millis(500).await;
             } else {
-                // Ошибки нет: просто гасим PD2
                 led_batt.set_low();
                 Timer::after_millis(100).await;
             }
         } else {
-            // Внешнего питания НЕТ, работаем от АКБ
-            led_ext.set_low(); // PA15 выключен
-            led_batt.set_high(); // PD2 горит непрерывно
-            Timer::after_millis(100).await;
+            // Автономный режим (АКБ): короткая вспышка PD2 на 50 мс раз в 5 секунд
+            led_ext.set_low();
+            led_batt.set_high();
+            Timer::after_millis(50).await;
+            led_batt.set_low();
+
+            // Спим 5 секунд, но каждые 250 мс проверяем, не вернулось ли 12В
+            for _ in 0..20 {
+                if !POWER_SOURCE.load(Ordering::Relaxed) {
+                    break;
+                }
+                Timer::after_millis(250).await;
+            }
         }
     }
 }
@@ -569,6 +671,8 @@ async fn main(spawner: Spawner) {
 
     //-----------------------------------------------------------
 
+    info!("{}", HW_REV);
+
     // чтение из флэш памяти сохраненых настроек
     let flash_base = 0x080E_0000 as *const SavedConfig;
     let mut latest_config: Option<SavedConfig> = None;
@@ -641,8 +745,14 @@ async fn main(spawner: Spawner) {
     // 3. PG (PC0) и STAT (PC1).
     // Внешние подтяжки 100 кОм к 3.3В, поэтому внутри МК используем Pull::None.
     // Передаем токен Irqs 4-м аргументом.
-    let pg_pin = ExtiInput::new(p.PC0, p.EXTI0, Pull::None, Irqs);
+    //let pg_pin = ExtiInput::new(p.PC0, p.EXTI0, Pull::None, Irqs);
     let stat_pin = ExtiInput::new(p.PC1, p.EXTI1, Pull::None, Irqs);
+
+    // ENABLE_PMID (PC3)
+    //let enable_pmid_pin = Output::new(p.PC3, Level::Low, Speed::Low);
+
+    // IS_12V (PC14)
+    //let is_12v_pin = ExtiInput::new(p.PC14, p.EXTI14, Pull::None, Irqs);
 
     // Инициализация пинов светодиодов
     let led_ext_pin = Output::new(p.PA15, Level::Low, Speed::Low);
@@ -749,8 +859,21 @@ async fn main(spawner: Spawner) {
     // Макрос #[task] возвращает Result<SpawnToken, SpawnError>,
     // поэтому распаковываем токен (unwrap) перед передачей в spawner.
     spawner.spawn(blink_led(led_pin).unwrap());
-    // Передаем otg_pin в задачу мониторинга
-    spawner.spawn(monitor_power_good(pg_pin, otg_pin).unwrap());
+
+    // Задача мониторинга для двух версий плат
+    #[cfg(feature = "hw-v1")]
+    {
+        let pg_pin = ExtiInput::new(p.PC0, p.EXTI0, Pull::None, Irqs);
+        spawner.spawn(monitor_power_good(pg_pin, otg_pin).unwrap());
+    }
+
+    #[cfg(feature = "hw-v2")]
+    {
+        let enable_pmid_pin = Output::new(p.PC3, Level::Low, Speed::Low);
+        let is_12v_pin = ExtiInput::new(p.PC14, p.EXTI14, Pull::None, Irqs);
+        spawner.spawn(monitor_power_good(is_12v_pin, otg_pin, enable_pmid_pin).unwrap());
+    }
+
     //
     spawner.spawn(monitor_charge_status(stat_pin).unwrap());
     // Запускаем менеджер индикации

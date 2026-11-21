@@ -104,6 +104,24 @@ pub async fn sensors_task(
     let mut last_door_state = crate::DOOR_CLOSED.load(core::sync::atomic::Ordering::Relaxed);
 
     loop {
+        // --- 0. ОПРОС ДВЕРИ (работает всегда, даже во сне от АКБ) ---
+
+        #[cfg(feature = "hw-v1")]
+        let current_door_state = pin_door.is_low();
+
+        #[cfg(feature = "hw-v2")]
+        let current_door_state = pin_door.is_high();
+
+        // Обновляем глобальную переменную (для экранов)
+        crate::DOOR_CLOSED.store(current_door_state, core::sync::atomic::Ordering::Relaxed);
+
+        // Если состояние изменилось по сравнению с прошлым разом — бьем тревогу!
+        if current_door_state != last_door_state {
+            //info!("Дверь изменила состояние! Срочная отправка телеметрии...");
+            crate::FORCE_TELEMETRY_UPDATE.store(true, core::sync::atomic::Ordering::Relaxed);
+            last_door_state = current_door_state;
+        }
+
         // 1. Если питание нестабильно, просто ждем 100 мс и пропускаем цикл измерений
         if !crate::POWER_STABLE.load(core::sync::atomic::Ordering::Relaxed) {
             Timer::after_millis(350).await;
@@ -124,18 +142,6 @@ pub async fn sensors_task(
             // Питание дрогнуло в процессе! Выбрасываем замеры, не обновляем фильтры.
             Timer::after_millis(10).await;
             continue;
-        }
-
-        let current_door_state = pin_door.is_low();
-
-        // Обновляем глобальную переменную (для экранов)
-        crate::DOOR_CLOSED.store(current_door_state, core::sync::atomic::Ordering::Relaxed);
-
-        // Если состояние изменилось по сравнению с прошлым разом — бьем тревогу!
-        if current_door_state != last_door_state {
-            //info!("Дверь изменила состояние! Срочная отправка телеметрии...");
-            crate::FORCE_TELEMETRY_UPDATE.store(true, core::sync::atomic::Ordering::Relaxed);
-            last_door_state = current_door_state;
         }
 
         let voltage_p = raw_to_volts(raw_p);

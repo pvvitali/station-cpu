@@ -235,6 +235,11 @@ pub async fn dwin_task(
 
     let tx_fut = async {
         loop {
+            if crate::POWER_SOURCE.load(Ordering::Relaxed) {
+                Timer::after(Duration::from_secs(1)).await;
+                continue;
+            }
+
             Timer::after(Duration::from_millis(300)).await;
 
             // --- 1. ЧТЕНИЕ ДАННЫХ ИЗ ГЛОБАЛЬНЫХ ПЕРЕМЕННЫХ ---

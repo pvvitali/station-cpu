@@ -203,7 +203,23 @@ macro_rules! send_server_ok {
     }};
 }
 
-const OTA_URL: &str = "http://sczprog.cloud/update.bin";
+//
+//const OTA_URL: &str = "http://sczprog.cloud/update.bin";
+//
+#[cfg(all(feature = "hw-v1", feature = "hw-v2"))]
+compile_error!("Нельзя включать фичи `hw-v1` и `hw-v2` одновременно!");
+
+#[cfg(not(any(feature = "hw-v1", feature = "hw-v2")))]
+compile_error!("Нужно выбрать ревизию платы: `hw-v1` или `hw-v2`!");
+
+#[cfg(feature = "hw-v1")]
+const OTA_URL: &str = "http://sczprog.cloud/update_v1.bin";
+
+#[cfg(feature = "hw-v2")]
+const OTA_URL: &str = "http://sczprog.cloud/update_v2.bin";
+//
+//
+//
 const MAX_FW_SIZE: usize = 256 * 1024; // Максимум = размер раздела ACTIVE (256 КБ)
 const CHUNK_SIZE: usize = 512;
 
@@ -457,6 +473,7 @@ pub async fn gsm_task(
         Timer::after_millis(500).await;
     }
     send_at!(uart, rx_buf, b"ATE0\r\n", "OK", 1000);
+    let _ = send_at!(uart, rx_buf, b"AT+CSCLK=1\r\n", "OK", 1000);
     info!("GSM: Связь AT установлена.");
 
     // --- НОВАЯ ПЕРЕМЕННАЯ ДЛЯ УПРАВЛЕНИЯ SIM-КАРТАМИ ---
@@ -498,6 +515,54 @@ pub async fn gsm_task(
             // Пропускаем текущий виток цикла, чтобы переинициализировать AT-команды
             continue;
         }
+        // ========================================================
+
+        // ========================================================
+        // --- ПРОВЕРКА ПИТАНИЯ И ОТЗЫВЧИВОСТИ МОДЕМА ---
+        if status.is_low() {
+            error!("GSM: Модем выключен (STATUS = LOW)! Запускаем через PWRKEY...");
+            crate::GPRS_OK.store(false, core::sync::atomic::Ordering::Relaxed);
+
+            pwrkey.set_high();
+            Timer::after_millis(1000).await;
+            pwrkey.set_low();
+
+            let mut timeout = 0;
+            while status.is_low() && timeout < 50 {
+                Timer::after_millis(100).await;
+                timeout += 1;
+            }
+
+            if status.is_low() {
+                error!(
+                    "GSM: Не удалось поднять модем (возможно, разряжена АКБ). Повтор через 10 сек..."
+                );
+                Timer::after_secs(10).await;
+                continue;
+            }
+
+            info!("GSM: Модем снова запущен (STATUS = HIGH)!");
+            Timer::after_secs(3).await;
+        }
+
+        // Проверяем, отвечает ли модем на AT (на случай зависания после просадки)
+        if !send_at!(uart, rx_buf, b"AT\r\n", "OK", 1000) {
+            error!("GSM: Нет ответа на AT! Выполняем аппаратный RESET...");
+            crate::GPRS_OK.store(false, core::sync::atomic::Ordering::Relaxed);
+
+            reset.set_high();
+            Timer::after_millis(500).await;
+            reset.set_low();
+            Timer::after_secs(5).await;
+
+            if !send_at!(uart, rx_buf, b"AT\r\n", "OK", 1000) {
+                error!("GSM: Модем не ответил после RESET. Повтор через 10 сек...");
+                Timer::after_secs(10).await;
+                continue;
+            }
+        }
+        let _ = send_at!(uart, rx_buf, b"ATE0\r\n", "OK", 1000);
+        let _ = send_at!(uart, rx_buf, b"AT+CSCLK=1\r\n", "OK", 1000);
         // ========================================================
 
         info!(
@@ -676,6 +741,9 @@ pub async fn gsm_task(
             crate::GSM_OK.store(true, core::sync::atomic::Ordering::Relaxed);
 
             'telemetry_loop: loop {
+                // Сбрасываем флаг, так как свежая телеметрия отправляется прямо сейчас
+                crate::FORCE_TELEMETRY_UPDATE.store(false, core::sync::atomic::Ordering::Relaxed);
+
                 // Читаем реальные данные с датчиков
                 let u1_mv = crate::U1_ACTUAL_MV.load(core::sync::atomic::Ordering::Relaxed);
                 let i1_mv = crate::I1_ACTUAL_MV.load(core::sync::atomic::Ordering::Relaxed);
@@ -788,6 +856,40 @@ pub async fn gsm_task(
                     break;
                 }
 
+                // --- АВТОНОМНЫЙ РЕЖИМ: УСЫПЛЯЕМ МОДЕМ (DTR = HIGH) ---
+                if crate::POWER_SOURCE.load(core::sync::atomic::Ordering::Relaxed) {
+                    info!("GSM: Автономный режим — переводим модем в сон (DTR = HIGH)...");
+                    dtr.set_high();
+
+                    loop {
+                        if !crate::GSM_ON.load(core::sync::atomic::Ordering::Relaxed) {
+                            dtr.set_low();
+                            break 'telemetry_loop;
+                        }
+                        if status.is_low() {
+                            dtr.set_low();
+                            error!("GSM: Модем отключился во сне (STATUS = LOW)!");
+                            crate::GSM_OK.store(false, core::sync::atomic::Ordering::Relaxed);
+                            crate::GPRS_OK.store(false, core::sync::atomic::Ordering::Relaxed);
+                            break 'telemetry_loop;
+                        }
+                        // Выходим из сна по 5-минутному замеру, двери или возврату 12В
+                        if crate::FORCE_TELEMETRY_UPDATE.load(core::sync::atomic::Ordering::Relaxed)
+                            || !crate::POWER_SOURCE.load(core::sync::atomic::Ordering::Relaxed)
+                        {
+                            info!("GSM: Пробуждение модема (DTR = LOW)...");
+                            dtr.set_low();
+                            Timer::after_millis(150).await; // Время на выход A7682E из сна
+                            break;
+                        }
+                        Timer::after_millis(200).await;
+                    }
+                    continue 'telemetry_loop;
+                }
+
+                // Штатный режим (12В): гарантируем, что DTR в LOW
+                dtr.set_low();
+
                 info!("GSM: Ожидание 60 сек. Слушаем ответы сервера...");
 
                 let wait_start = embassy_time::Instant::now();
@@ -808,11 +910,19 @@ pub async fn gsm_task(
                         break 'telemetry_loop; // ИСПРАВЛЕНИЕ: Выходим из внешнего цикла телеметрии
                     }
 
+                    // --- ПРОВЕРКА: НЕ ОТКЛЮЧИЛСЯ ЛИ МОДЕМ ВО ВРЕМЯ ОЖИДАНИЯ ---
+                    if status.is_low() {
+                        error!("GSM: Обнаружено отключение модема (STATUS = LOW)! Перезапуск...");
+                        crate::GSM_OK.store(false, core::sync::atomic::Ordering::Relaxed);
+                        crate::GPRS_OK.store(false, core::sync::atomic::Ordering::Relaxed);
+                        break 'telemetry_loop;
+                    }
+
                     // --- ПРОВЕРЯЕМ СИГНАЛ ОТ ДОВОДЧИКА ---
                     if crate::FORCE_TELEMETRY_UPDATE.load(core::sync::atomic::Ordering::Relaxed) {
                         crate::FORCE_TELEMETRY_UPDATE
                             .store(false, core::sync::atomic::Ordering::Relaxed);
-                        info!("GSM: Доводчик завершил работу. Внеочередная отправка телеметрии!");
+                        info!("GSM: Внеочередная отправка телеметрии!");
                         break; // Выходим из ожидания, сразу начнется новый виток с отправкой данных!
                     }
 
@@ -1097,6 +1207,8 @@ pub async fn gsm_task(
             error!("GSM: Ошибка подключения к TCP. Повтор через 10 сек...");
             crate::GSM_OK.store(false, core::sync::atomic::Ordering::Relaxed);
         }
+
+        dtr.set_low();
 
         send_at!(uart, rx_buf, b"AT+CIPCLOSE=0\r\n", "OK", 2000);
         Timer::after_secs(10).await;

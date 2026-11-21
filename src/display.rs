@@ -24,6 +24,9 @@ use embedded_graphics::{
     text::{Baseline, Text, TextStyleBuilder},
 };
 
+use core::sync::atomic::Ordering;
+use embassy_time::{Duration, Timer, with_timeout};
+
 // --- СТРУКТУРЫ ТЕЛЕМЕТРИИ (Восстановлено из main.rs) ---
 
 #[derive(Clone, Default)]
@@ -77,10 +80,41 @@ pub async fn display_task(
     // Именно эту переменную потерял компилятор
     let text_layout = TextStyleBuilder::new().baseline(Baseline::Top).build();
 
-    loop {
-        let cmd = DISPLAY_CHANNEL.receive().await;
-        display.clear(); // Очищаем экран
+    let mut is_display_off = false;
 
+    loop {
+        // --- АВТОНОМНЫЙ РЕЖИМ (АКБ): ГАСИМ OLED И УБИРАЕМ ПОДПИТКУ ПО SPI ---
+        if crate::POWER_SOURCE.load(Ordering::Relaxed) {
+            if !is_display_off {
+                rst.set_low();
+                // Опускаем CS (PB12) и DC (PB14) в LOW, чтобы убрать паразитные 1.57В с 5V_PMID
+                embassy_stm32::pac::GPIOB.bsrr().write(|w| {
+                    w.set_br(12, true);
+                    w.set_br(14, true);
+                });
+                is_display_off = true;
+            }
+            while DISPLAY_CHANNEL.try_receive().is_ok() {}
+            Timer::after_millis(300).await;
+            continue;
+        }
+
+        // --- ВОЗВРАТ 12В: ПОВТОРНЫЙ ЗАПУСК OLED ---
+        if is_display_off {
+            display.reset(&mut rst, &mut embassy_time::Delay).unwrap();
+            display.init().unwrap();
+            display.clear();
+            display.flush().unwrap();
+            is_display_off = false;
+        }
+
+        // Ждём данные с таймаутом, чтобы быстро реагировать на пропадание 12В
+        let cmd = match with_timeout(Duration::from_millis(300), DISPLAY_CHANNEL.receive()).await {
+            Ok(cmd) => cmd,
+            Err(_) => continue,
+        };
+
+        display.clear(); // Очищаем экран
         match cmd {
             DisplayCmd::Log(msg) => {
                 // Координата Y=8 — это базовая линия для первой строки шрифта 5x8

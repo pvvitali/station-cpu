@@ -290,9 +290,9 @@ async fn monitor_charge_status(mut stat: ExtiInput<'static, Async>) {
 async fn blink_led(mut led: Output<'static>) {
     loop {
         led.set_high();
-        Timer::after_millis(500).await;
+        Timer::after_millis(100).await;
         led.set_low();
-        Timer::after_millis(500).await;
+        Timer::after_millis(100).await;
     }
 }
 
@@ -557,6 +557,18 @@ async fn main(spawner: Spawner) {
 
     //-----------------------------------------------------------
 
+    const BOOT_PANIC_ADDR: *mut u32 = 0x2003_FFF0 as *mut u32;
+    unsafe {
+        if core::ptr::read_volatile(BOOT_PANIC_ADDR) == 0xDEAD_B007 {
+            error!("ВНИМАНИЕ: Загрузчик уходил в панику перед этим запуском!!!");
+            core::ptr::write_volatile(BOOT_PANIC_ADDR, 0);
+        } else {
+            info!("ВНИМАНИЕ: Загрузчик не уходил в панику!!!");
+        }
+    }
+
+    //-----------------------------------------------------------
+
     // чтение из флэш памяти сохраненых настроек
     let flash_base = 0x080E_0000 as *const SavedConfig;
     let mut latest_config: Option<SavedConfig> = None;
@@ -649,7 +661,7 @@ async fn main(spawner: Spawner) {
     let gsm_status = Input::new(p.PA12, Pull::None);
     let gsm_ring = Input::new(p.PC9, Pull::None);
 
-    info!("Станция катодной защиты: Система питания инициализирована!");
+    info!("Станция катодной защиты [v2.0 OTA]: Система питания инициализирована!");
 
     // =========================================================
     // 2. ИНИЦИАЛИЗАЦИЯ ДИСПЛЕЯ

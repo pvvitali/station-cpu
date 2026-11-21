@@ -4,7 +4,7 @@ MEMORY
   FLASH            : ORIGIN = 0x08020000, LENGTH = 256K
   BOOTLOADER_STATE : ORIGIN = 0x08010000, LENGTH = 64K
   DFU              : ORIGIN = 0x08060000, LENGTH = 384K
-  RAM              : ORIGIN = 0x20000000, LENGTH = 256K
+  RAM              : ORIGIN = 0x20000000, LENGTH = 256K - 16
 }
 
 /* Относительно bank1_region2 (старт 0x08010000) */

@@ -136,6 +136,11 @@ fn parse_server_command(msg: &str) -> ServerCommand {
     match cmd_id {
         "1" => ServerCommand::Heartbeat(tx_id),
         "3" if parts.len() >= 3 => {
+            // Перехватываем команду "Прошивка старых станций" ($3|7|162)
+            if parts.len() == 3 && parts[1] == "7" && parts[2].trim() == "162" {
+                return ServerCommand::UpdateFlash(tx_id);
+            }
+
             // Парсим строку в u32 безопасно
             if let Ok(period) = parts[2].parse::<u32>() {
                 ServerCommand::SetPeriod {

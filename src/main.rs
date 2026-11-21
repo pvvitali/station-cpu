@@ -20,6 +20,8 @@ use embassy_stm32::interrupt;
 use embassy_stm32::mode::Async;
 use embassy_time::{Duration, Timer, with_timeout}; // Добавляем импорт модуля прерываний
 
+use embassy_stm32::wdg::IndependentWatchdog;
+
 #[cfg(feature = "hw-v1")]
 pub const HW_REV: &str = "HW_v1";
 
@@ -264,6 +266,7 @@ async fn monitor_power_good(
         false
     } else {
         enable_pmid.set_low();
+        set_ext_uart_tx_sleep(true);
         POWER_SOURCE.store(true, Ordering::Relaxed);
         POWER_STABLE.store(false, Ordering::Relaxed); // Ставим АЦП на паузу
         warn!("[ПИТАНИЕ] СТАРТ: Работаем от АКБ! 5V_PMID отключено (IS_12V = 0)");
@@ -283,6 +286,7 @@ async fn monitor_power_good(
 
                         info!("[ПИТАНИЕ] Внешнее напряжение 12В восстановлено! 5V_PMID включено.");
                         Timer::after_millis(250).await;
+                        set_ext_uart_tx_sleep(false);
                         POWER_SOURCE.store(false, Ordering::Relaxed);
                         POWER_STABLE.store(true, Ordering::Relaxed);
                         // перепроверить удаление crate::FORCE_TELEMETRY_UPDATE.store
@@ -316,6 +320,7 @@ async fn monitor_power_good(
             if is_12v.is_low() {
                 POWER_STABLE.store(false, Ordering::Relaxed); // Пауза АЦП на время сна
                 enable_pmid.set_low();
+                set_ext_uart_tx_sleep(true);
                 otg.set_low();
                 POWER_SOURCE.store(true, Ordering::Relaxed);
                 is_battery_mode = true;
@@ -325,6 +330,27 @@ async fn monitor_power_good(
             }
         }
     }
+}
+
+#[cfg(feature = "hw-v2")]
+fn set_ext_uart_tx_sleep(sleep: bool) {
+    use embassy_stm32::pac::gpio::vals::Moder;
+    let mode = if sleep {
+        Moder::ANALOG
+    } else {
+        Moder::ALTERNATE
+    };
+
+    // PA2 (Bluetooth USART2_TX) — главный источник 0.9В на 3_3V_PMID
+    embassy_stm32::pac::GPIOA.moder().modify(|w| {
+        w.set_moder(2, mode);
+    });
+
+    // PC6 (DWIN USART6_TX) и PC10 (RS485 USART3_TX)
+    embassy_stm32::pac::GPIOC.moder().modify(|w| {
+        w.set_moder(6, mode);
+        w.set_moder(10, mode);
+    });
 }
 
 // --- Задача 2: Мониторинг статуса зарядки (STAT) ---
@@ -651,7 +677,7 @@ async fn main(spawner: Spawner) {
     config.rcc.apb1_pre = APBPrescaler::DIV2; // Шина APB1 = 24 MHz (UART, Таймеры)
     config.rcc.apb2_pre = APBPrescaler::DIV1; // Шина APB2 = 48 MHz (SPI1/4, АЦП)
 
-    // Принудительно разрешаем работу SWD-отладчика в спящем режиме
+    // Принудительно разрешаем работу SWD-отладчика в спящем режиме = true
     config.enable_debug_during_sleep = true;
 
     // Применяем настройки железа
@@ -933,6 +959,11 @@ async fn main(spawner: Spawner) {
         .unwrap(),
     );
 
+    #[cfg(feature = "hw-v2")]
+    if POWER_SOURCE.load(Ordering::Relaxed) {
+        set_ext_uart_tx_sleep(true);
+    }
+
     //Запускаем задачу GSM
     spawner.spawn(
         gsm::gsm_task(
@@ -944,7 +975,12 @@ async fn main(spawner: Spawner) {
 
     spawner.spawn(encoder::auto_regulation_task().unwrap());
 
+    // Максимально безопасный таймаут для IWDG STM32F4 — 32 секунды
+    let mut wdt = IndependentWatchdog::new(p.IWDG, 32_000_000);
+    wdt.unleash();
+
     loop {
+        wdt.pet();
         Timer::after_millis(5000).await;
     }
 }

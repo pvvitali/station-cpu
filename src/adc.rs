@@ -117,9 +117,16 @@ pub async fn sensors_task(
 
         // Если состояние изменилось по сравнению с прошлым разом — бьем тревогу!
         if current_door_state != last_door_state {
-            //info!("Дверь изменила состояние! Срочная отправка телеметрии...");
-            crate::FORCE_TELEMETRY_UPDATE.store(true, core::sync::atomic::Ordering::Relaxed);
             last_door_state = current_door_state;
+
+            if crate::POWER_SOURCE.load(Ordering::Relaxed) {
+                // Автономный режим: сначала включаем 5V_PMID и делаем свежий замер АЦП,
+                // а уже потом monitor_power_good сам выставит FORCE_TELEMETRY_UPDATE
+                crate::WAKE_FOR_MEASURE.signal(());
+            } else {
+                // Штатный режим (12В): датчики и так работают, шлём телеметрию сразу
+                crate::FORCE_TELEMETRY_UPDATE.store(true, Ordering::Relaxed);
+            }
         }
 
         // 1. Если питание нестабильно, просто ждем 100 мс и пропускаем цикл измерений
@@ -164,8 +171,15 @@ pub async fn sensors_task(
 
         // ФИЛЬТРАЦИЯ (например, 80% старого значения и 20% нового)
         // Чем меньше коэффициент у нового значения (0.2), тем сильнее сглаживание
-        i1_filtered = (i1_filtered * 0.8) + (current_m1_raw * 0.2);
-        i2_filtered = (i2_filtered * 0.8) + (current_m2_raw * 0.2);
+        // В автономном режиме (АКБ) фильтр не используем, чтобы не тянуть старый ток через 5-минутный сон
+        if crate::POWER_SOURCE.load(Ordering::Relaxed) {
+            i1_filtered = current_m1_raw;
+            i2_filtered = current_m2_raw;
+        } else {
+            // Штатный режим (220В): плавное сглаживание (80% старого + 20% нового)
+            i1_filtered = (i1_filtered * 0.8) + (current_m1_raw * 0.2);
+            i2_filtered = (i2_filtered * 0.8) + (current_m2_raw * 0.2);
+        }
 
         // Вычисляем реальное напряжение батареи через делитель 100к / 220к
         let bat_voltage = raw_to_volts(raw_bat) * (320.0 / 220.0);

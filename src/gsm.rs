@@ -963,6 +963,8 @@ pub async fn gsm_task(
                                     let cmd = parse_server_command(text);
                                     match cmd {
                                         ServerCommand::Heartbeat(tx_id) => {
+                                            crate::LAST_GSM_CMD
+                                                .store(1, core::sync::atomic::Ordering::Relaxed);
                                             info!(
                                                 "GSM: Запрос обновления данных (tx: {})",
                                                 tx_id.as_str()
@@ -975,11 +977,11 @@ pub async fn gsm_task(
                                             Timer::after_millis(100).await;
 
                                             // 3. ПРЕРЫВАЕМ 60-СЕКУНДНОЕ ОЖИДАНИЕ!
-                                            // Программа выйдет из `while` и сразу начнет новый виток `loop`,
-                                            // соберет свежую телеметрию и отправит её.
                                             break;
                                         }
                                         ServerCommand::StepUp10V(tx_id) => {
+                                            crate::LAST_GSM_CMD
+                                                .store(7, core::sync::atomic::Ordering::Relaxed);
                                             info!("GSM: Команда +10V (tx: {})", tx_id.as_str());
                                             crate::AUTO_MODE.store(
                                                 false,
@@ -990,6 +992,8 @@ pub async fn gsm_task(
                                             send_server_ok!(uart, rx_buf, "7", tx_id.as_str());
                                         }
                                         ServerCommand::StepDown10V(tx_id) => {
+                                            crate::LAST_GSM_CMD
+                                                .store(8, core::sync::atomic::Ordering::Relaxed);
                                             info!("GSM: Команда -10V (tx: {})", tx_id.as_str());
                                             crate::AUTO_MODE.store(
                                                 false,
@@ -1000,6 +1004,8 @@ pub async fn gsm_task(
                                             send_server_ok!(uart, rx_buf, "8", tx_id.as_str());
                                         }
                                         ServerCommand::StepUp1V(tx_id) => {
+                                            crate::LAST_GSM_CMD
+                                                .store(5, core::sync::atomic::Ordering::Relaxed);
                                             info!("GSM: Команда +1V (tx: {})", tx_id.as_str());
                                             crate::AUTO_MODE.store(
                                                 false,
@@ -1010,6 +1016,8 @@ pub async fn gsm_task(
                                             send_server_ok!(uart, rx_buf, "5", tx_id.as_str());
                                         }
                                         ServerCommand::StepDown1V(tx_id) => {
+                                            crate::LAST_GSM_CMD
+                                                .store(6, core::sync::atomic::Ordering::Relaxed);
                                             info!("GSM: Команда -1V (tx: {})", tx_id.as_str());
                                             crate::AUTO_MODE.store(
                                                 false,
@@ -1020,6 +1028,8 @@ pub async fn gsm_task(
                                             send_server_ok!(uart, rx_buf, "6", tx_id.as_str());
                                         }
                                         ServerCommand::StepUp0_1V(tx_id) => {
+                                            crate::LAST_GSM_CMD
+                                                .store(13, core::sync::atomic::Ordering::Relaxed);
                                             info!("GSM: Команда +0.1V (tx: {})", tx_id.as_str());
                                             crate::AUTO_MODE.store(
                                                 false,
@@ -1030,6 +1040,8 @@ pub async fn gsm_task(
                                             send_server_ok!(uart, rx_buf, "13", tx_id.as_str());
                                         }
                                         ServerCommand::StepDown0_1V(tx_id) => {
+                                            crate::LAST_GSM_CMD
+                                                .store(14, core::sync::atomic::Ordering::Relaxed);
                                             info!("GSM: Команда -0.1V (tx: {})", tx_id.as_str());
                                             crate::AUTO_MODE.store(
                                                 false,
@@ -1040,6 +1052,8 @@ pub async fn gsm_task(
                                             send_server_ok!(uart, rx_buf, "14", tx_id.as_str());
                                         }
                                         ServerCommand::PowerOff(tx_id) => {
+                                            crate::LAST_GSM_CMD
+                                                .store(12, core::sync::atomic::Ordering::Relaxed);
                                             info!("GSM: Команда Выкл. (tx: {})", tx_id.as_str());
                                             crate::AUTO_MODE.store(
                                                 false,
@@ -1056,6 +1070,8 @@ pub async fn gsm_task(
                                                 .store(true, core::sync::atomic::Ordering::Relaxed);
                                         }
                                         ServerCommand::PowerOn(tx_id) => {
+                                            crate::LAST_GSM_CMD
+                                                .store(11, core::sync::atomic::Ordering::Relaxed);
                                             info!("GSM: Команда Вкл. (tx: {})", tx_id.as_str());
                                             crate::AUTO_MODE.store(
                                                 false,
@@ -1075,7 +1091,7 @@ pub async fn gsm_task(
                                                 }
                                             }
 
-                                            // Восстанавливаем ШИМ, приклеиваем бит 31 (в памяти и так уже лежит это число, не затираем ресурс флешки)
+                                            // Восстанавливаем ШИМ, приклеиваем бит 31
                                             let _ = crate::PWM_CHANNEL
                                                 .try_send(restore_pwm | (1 << 31));
                                             send_server_ok!(uart, rx_buf, "11", tx_id.as_str());
@@ -1086,6 +1102,8 @@ pub async fn gsm_task(
                                                 .store(true, core::sync::atomic::Ordering::Relaxed);
                                         }
                                         ServerCommand::SetPeriod { tx_id, period_ms } => {
+                                            crate::LAST_GSM_CMD
+                                                .store(3, core::sync::atomic::Ordering::Relaxed);
                                             info!(
                                                 "GSM: Изменение интервала передачи (tx: {}, period: {} сек)",
                                                 tx_id.as_str(),
@@ -1106,11 +1124,12 @@ pub async fn gsm_task(
                                             send_server_ok!(uart, rx_buf, "3", tx_id.as_str());
                                             Timer::after_millis(200).await;
 
-                                            // 3. Прерываем текущее ожидание, чтобы станция сразу отправила
-                                            // свежий пакет, в котором 12-е поле уже будет содержать новый интервал.
+                                            // 3. Прерываем текущее ожидание
                                             break;
                                         }
                                         ServerCommand::SetAuto { tx_id, target_u_mv } => {
+                                            crate::LAST_GSM_CMD
+                                                .store(9, core::sync::atomic::Ordering::Relaxed);
                                             info!(
                                                 "GSM: Включен АВТО режим. Цель: {} мВ (tx: {})",
                                                 target_u_mv,
@@ -1130,6 +1149,8 @@ pub async fn gsm_task(
                                             break;
                                         }
                                         ServerCommand::DisableAuto(tx_id) => {
+                                            crate::LAST_GSM_CMD
+                                                .store(10, core::sync::atomic::Ordering::Relaxed);
                                             info!(
                                                 "GSM: Отключен АВТО режим (tx: {})",
                                                 tx_id.as_str()
@@ -1146,6 +1167,8 @@ pub async fn gsm_task(
                                             break;
                                         }
                                         ServerCommand::UpdateFlash(tx_id) => {
+                                            crate::LAST_GSM_CMD
+                                                .store(15, core::sync::atomic::Ordering::Relaxed);
                                             info!(
                                                 "GSM: Команда Обновления прошивки (tx: {})",
                                                 tx_id.as_str()
@@ -1189,13 +1212,7 @@ pub async fn gsm_task(
                                                 }
                                             }
                                         }
-                                        ServerCommand::Unknown => {} //
-                                                                     // _ => {
-                                                                     //     info!(
-                                                                     //         "Получена команда: {:?}",
-                                                                     //         defmt::Debug2Format(&cmd)
-                                                                     //     );
-                                                                     // }
+                                        ServerCommand::Unknown => {}
                                     }
                                 }
                             }

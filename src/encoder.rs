@@ -277,7 +277,11 @@ pub async fn auto_regulation_task() {
     loop {
         Timer::after(Duration::from_secs(3)).await;
 
-        if !crate::AUTO_MODE.load(Ordering::Relaxed) {
+        // Не регулируем, если авто-режим выключен, работаем от АКБ или питание нестабильно
+        if !crate::AUTO_MODE.load(Ordering::Relaxed)
+            || crate::POWER_SOURCE.load(Ordering::Relaxed)
+            || !crate::POWER_STABLE.load(Ordering::Relaxed)
+        {
             continue;
         }
 

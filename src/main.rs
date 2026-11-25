@@ -1,6 +1,8 @@
 #![no_std]
 #![no_main]
 
+pub const FW_VERSION: &str = "S.26.11.02";
+
 use embassy_stm32::Config;
 use embassy_stm32::rcc::{
     AHBPrescaler, APBPrescaler, Hse, HseMode, Pll, PllPDiv, PllSource, Sysclk,
@@ -9,10 +11,11 @@ use embassy_stm32::time::Hertz;
 
 use defmt::{error, info, warn};
 use defmt_rtt as _;
-use panic_probe as _;
+//use panic_probe as _;
+use panic_reset as _;
 
 use embassy_executor::Spawner;
-use embassy_futures::select::{Either, select};
+use embassy_futures::select::{Either, Either3, select, select3};
 use embassy_stm32::bind_interrupts;
 use embassy_stm32::exti::{self, ExtiInput};
 use embassy_stm32::gpio::{Input, Level, Output, Pull, Speed};
@@ -100,6 +103,11 @@ pub static POLARIZATION_POTENTIAL_MV: core::sync::atomic::AtomicI32 =
 // Глобальная переменная для ID (по умолчанию 10000000)
 pub static STATION_ID: AtomicU32 = AtomicU32::new(10000000);
 
+use embassy_sync::signal::Signal;
+//
+pub static FORCE_POL_MEASURE: Signal<ThreadModeRawMutex, ()> = Signal::new();
+pub static WAKE_FOR_MEASURE: Signal<ThreadModeRawMutex, ()> = Signal::new();
+
 // ------------------------------------------------
 
 // --- ДОБАВЛЕННЫЙ КОД ДЛЯ ДОВОДЧИКА НАПРЯЖЕНИЯ ---
@@ -136,6 +144,11 @@ pub static SAVE_FLASH_REQUEST: AtomicBool = AtomicBool::new(false);
 pub static FLASH_SAVE_COUNTDOWN: AtomicU32 = AtomicU32::new(0);
 
 pub static OTA_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+use core::sync::atomic::AtomicU8;
+//
+// Код последней команды от GSM-сервера (0 = нет активного уведомления)
+pub static LAST_GSM_CMD: AtomicU8 = AtomicU8::new(0);
 //---------------------------------------
 
 // --- Структура для сохранения (с Магическим словом) ---
@@ -273,33 +286,55 @@ async fn monitor_power_good(
         true
     };
 
+    // Флаг, чтобы при старте от АКБ сделать первый замер через 3 сек, а не ждать 5 минут
+    let mut first_batt_measure = is_battery_mode;
+
     loop {
         if is_battery_mode {
-            // Ждём либо 5 минут (300 сек), либо мгновенного возврата 12В
-            match select(Timer::after_secs(300), is_12v.wait_for_high()).await {
-                Either::Second(_) => {
+            let wait_secs = if first_batt_measure { 3 } else { 300 };
+
+            // Ждём: 1) таймер (3с при старте / 300с обычно), 2) возврат 12В, 3) сигнал от двери
+            match select3(
+                Timer::after_secs(wait_secs),
+                is_12v.wait_for_high(),
+                WAKE_FOR_MEASURE.wait(),
+            )
+            .await
+            {
+                Either3::Second(_) => {
                     Timer::after_millis(50).await; // Антидребезг
                     if is_12v.is_high() {
                         otg.set_low();
                         enable_pmid.set_high();
                         is_battery_mode = false;
+                        first_batt_measure = false;
 
-                        info!("[ПИТАНИЕ] Внешнее напряжение 12В восстановлено! 5V_PMID включено.");
-                        Timer::after_millis(250).await;
+                        info!(
+                            "[ПИТАНИЕ] Внешнее напряжение 12В восстановлено! Ждём 1 сек и измеряем..."
+                        );
                         set_ext_uart_tx_sleep(false);
-                        POWER_SOURCE.store(false, Ordering::Relaxed);
+
+                        // 1. Пауза 1 сек на выход силового блока на рабочий режим
+                        Timer::after_secs(1).await;
+
+                        // 2. Разрешаем АЦП сделать 1-2 свежих замера (пока POWER_SOURCE ещё true,
+                        // GSM спит, а фильтр тока отключён — значения обновятся мгновенно)
                         POWER_STABLE.store(true, Ordering::Relaxed);
-                        // перепроверить удаление crate::FORCE_TELEMETRY_UPDATE.store
-                        //crate::FORCE_TELEMETRY_UPDATE.store(true, Ordering::Relaxed);
+                        Timer::after_millis(700).await;
+
+                        // 3. Будим GSM — в первом же пакете уйдут реальные U, I и T
+                        POWER_SOURCE.store(false, Ordering::Relaxed);
                     }
                 }
-                Either::First(_) => {
-                    // Прошло 5 минут: кратковременно подаём 5В для точного замера АЦП
-                    info!("[ПИТАНИЕ] Автономный замер (5 мин): включаем OTG и 5V_PMID...");
+                Either3::First(_) | Either3::Third(_) => {
+                    first_batt_measure = false;
+
+                    // Кратковременно подаём 5В для точного замера АЦП
+                    info!("[ПИТАНИЕ] Автономный замер: включаем OTG и 5V_PMID...");
                     otg.set_high();
                     Timer::after_millis(50).await;
                     enable_pmid.set_high();
-                    Timer::after_millis(250).await; // Стабилизация 5В и датчиков
+                    Timer::after_millis(500).await; // Ждём стабилизации 5В и разряда силовых конденсаторов
 
                     // Разрешаем АЦП сделать 1-2 свежих замера (цикл adc.rs = 300-350 мс)
                     POWER_STABLE.store(true, Ordering::Relaxed);
@@ -309,6 +344,8 @@ async fn monitor_power_good(
                     // Сразу гасим 5В ДО того, как модем начнёт передачу
                     enable_pmid.set_low();
                     otg.set_low();
+                    WAKE_FOR_MEASURE.reset();
+
                     info!("[ПИТАНИЕ] Замер завершён, 5V_PMID отключено. Будим GSM...");
                     crate::FORCE_TELEMETRY_UPDATE.store(true, Ordering::Relaxed);
                 }
@@ -318,15 +355,23 @@ async fn monitor_power_good(
             Timer::after_millis(50).await; // Антидребезг
 
             if is_12v.is_low() {
-                POWER_STABLE.store(false, Ordering::Relaxed); // Пауза АЦП на время сна
+                POWER_STABLE.store(false, Ordering::Relaxed); // Пауза АЦП
+
+                // Однократно держим 5V_PMID от АКБ 1.2 сек, чтобы силовой блок разрядил конденсаторы
+                otg.set_high();
+                Timer::after_millis(3000).await;
+
                 enable_pmid.set_low();
                 set_ext_uart_tx_sleep(true);
                 otg.set_low();
                 POWER_SOURCE.store(true, Ordering::Relaxed);
                 is_battery_mode = true;
 
-                warn!("[ПИТАНИЕ] Отключение 12В! Переход на АКБ, 5V_PMID отключено.");
-                crate::FORCE_TELEMETRY_UPDATE.store(true, Ordering::Relaxed);
+                warn!("[ПИТАНИЕ] Отключение 12В! Пауза 1 сек перед контрольным замером...");
+                //Timer::after_secs(1).await;
+
+                // Запускаем штатный цикл автономного замера (5V_PMID -> АЦП -> отправка GSM)
+                WAKE_FOR_MEASURE.signal(());
             }
         }
     }
@@ -410,9 +455,9 @@ async fn blink_led(mut led: Output<'static>) {
             Timer::after_millis(500).await;
         } else {
             led.set_high();
-            Timer::after_millis(100).await;
+            Timer::after_millis(500).await;
             led.set_low();
-            Timer::after_millis(100).await;
+            Timer::after_millis(500).await;
         }
     }
 }
@@ -443,14 +488,14 @@ async fn led_manager(mut led_ext: Output<'static>, mut led_batt: Output<'static>
                 Timer::after_millis(100).await;
             }
         } else {
-            // Автономный режим (АКБ): короткая вспышка PD2 на 50 мс раз в 5 секунд
+            // Автономный режим (АКБ): короткая вспышка PD2 на 50 мс раз в 2 секунды
             led_ext.set_low();
             led_batt.set_high();
             Timer::after_millis(50).await;
             led_batt.set_low();
 
-            // Спим 5 секунд, но каждые 250 мс проверяем, не вернулось ли 12В
-            for _ in 0..20 {
+            // Спим 2 секунды, но каждые 250 мс проверяем, не вернулось ли 12В
+            for _ in 0..8 {
                 if !POWER_SOURCE.load(Ordering::Relaxed) {
                     break;
                 }
@@ -464,44 +509,60 @@ async fn led_manager(mut led_ext: Output<'static>, mut led_batt: Output<'static>
 // и запрос на запись во флэш
 #[embassy_executor::task]
 pub async fn stats_task() {
-    loop {
-        Timer::after(embassy_time::Duration::from_secs(3600)).await;
-        info!("Ежечасный замер: Отключение станции на 4 сек...");
+    let mut next_hourly = embassy_time::Instant::now() + Duration::from_secs(3600);
 
-        // 1. ЗАПОМИНАЕМ ТЕКУЩИЙ ШИМ И РЕЖИМ ИЗ ОПЕРАТИВНОЙ ПАМЯТИ
+    loop {
+        let is_hourly = match select(Timer::at(next_hourly), FORCE_POL_MEASURE.wait()).await {
+            Either::First(_) => {
+                next_hourly += Duration::from_secs(3600);
+                info!("Ежечасный замер: Отключение станции на 4 сек...");
+                true
+            }
+            Either::Second(_) => {
+                info!("Ручной замер (GET): Отключение станции на 4 сек...");
+                false
+            }
+        };
+
+        // 1. Запоминаем текущий ШИМ и режим
         let saved_pwm = crate::PWM1_ACTUAL.load(Ordering::Relaxed);
         let was_auto = crate::AUTO_MODE.load(Ordering::Relaxed);
 
         crate::AUTO_MODE.store(false, Ordering::Relaxed);
         let _ = crate::PWM_CHANNEL.try_send(0 | (1 << 31));
 
-        // 2. Ждем 4 секунды (деполяризация трубы)
-        Timer::after(embassy_time::Duration::from_secs(4)).await;
+        // 2. Ждём 4 секунды (деполяризация трубы)
+        Timer::after(Duration::from_secs(4)).await;
 
-        // 3. Замер
+        // 3. Замер поляризационного потенциала
         let pol_mv = crate::P1_ACTUAL_MV.load(Ordering::Relaxed).abs();
-        info!("Ежечасный замер: Защитный потенциал = {} мВ", pol_mv);
+        info!("Замер завершён: Поляризационный потенциал = {} мВ", pol_mv);
         crate::POLARIZATION_POTENTIAL_MV.store(pol_mv, Ordering::Relaxed);
 
-        // 4. ВКЛЮЧАЕМ СТАНЦИЮ, ИСПОЛЬЗУЯ ЗАПОМНЕННЫЙ ШИМ
+        // 4. Возвращаем ШИМ и авто-режим
         let _ = crate::PWM_CHANNEL.try_send(saved_pwm | (1 << 31));
         crate::AUTO_MODE.store(was_auto, Ordering::Relaxed);
 
-        Timer::after(embassy_time::Duration::from_millis(500)).await;
+        Timer::after(Duration::from_millis(500)).await;
         crate::FORCE_TELEMETRY_UPDATE.store(true, Ordering::Relaxed);
 
-        // 5. Расчет энергии и сохранение
-        let u_mv = crate::U1_ACTUAL_MV.load(Ordering::Relaxed);
-        let i_mv = crate::I1_ACTUAL_MV.load(Ordering::Relaxed);
-        let u_v = (u_mv as f32) / 1000.0;
-        let i_v = (i_mv as f32) / 1000.0;
-        let added_kwh = (u_v * i_v) / 1000.0;
+        // 5. Наработку и кВт·ч начисляем ТОЛЬКО по ежечасному таймеру
+        if is_hourly {
+            let u_mv = crate::U1_ACTUAL_MV.load(Ordering::Relaxed);
+            let i_mv = crate::I1_ACTUAL_MV.load(Ordering::Relaxed);
+            let u_v = (u_mv as f32) / 1000.0;
+            let i_v = (i_mv as f32) / 1000.0;
+            let added_kwh = (u_v * i_v) / 1000.0;
 
-        let current_energy = f32::from_bits(ENERGY_KWH.load(Ordering::Relaxed));
-        ENERGY_KWH.store((current_energy + added_kwh).to_bits(), Ordering::Relaxed);
-        HOURS_WORK.fetch_add(1, Ordering::Relaxed);
+            let current_energy = f32::from_bits(ENERGY_KWH.load(Ordering::Relaxed));
+            ENERGY_KWH.store((current_energy + added_kwh).to_bits(), Ordering::Relaxed);
+            HOURS_WORK.fetch_add(1, Ordering::Relaxed);
+        }
 
         SAVE_FLASH_REQUEST.store(true, Ordering::Relaxed);
+
+        // Сбрасываем случайные повторные нажатия GET, прилетевшие за время 4-секундной паузы
+        FORCE_POL_MEASURE.reset();
     }
 }
 

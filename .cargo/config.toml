@@ -8,12 +8,12 @@ rustflags = [
 [build]
 target = "thumbv7em-none-eabihf"
 
-[env]
-DEFMT_LOG = "info"
-
 #[env]
+#DEFMT_LOG = "info"
+
+[env]
 # Оставит только error!(). Если хотите выключить логи ПОЛНОСТЬЮ, напишите "off"
-#DEFMT_LOG = "error"
+DEFMT_LOG = "error"
 
 #cargo build --release
 #probe-rs run --chip STM32F412RG target\thumbv7em-none-eabihf\release\station-cpu

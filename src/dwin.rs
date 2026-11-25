@@ -6,6 +6,36 @@ use embassy_stm32::{Peri, bind_interrupts, peripherals, usart};
 use embassy_time::{Duration, Timer};
 use embedded_io_async::Write;
 
+use core::fmt::Write as FmtWrite;
+
+struct StrBuf<const N: usize> {
+    buf: [u8; N],
+    len: usize,
+}
+
+impl<const N: usize> StrBuf<N> {
+    fn new() -> Self {
+        Self {
+            buf: [0; N],
+            len: 0,
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
+    }
+}
+
+impl<const N: usize> FmtWrite for StrBuf<N> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let bytes = s.as_bytes();
+        let n = bytes.len().min(N - self.len);
+        self.buf[self.len..self.len + n].copy_from_slice(&bytes[..n]);
+        self.len += n;
+        Ok(())
+    }
+}
+
 // ИСПРАВЛЕНИЕ: Используем правильные аппаратные имена прерываний для STM32F4 (STREAM вместо CH)
 bind_interrupts!(struct Irqs {
     USART6 => usart::InterruptHandler<peripherals::USART6>;
@@ -44,6 +74,14 @@ async fn dwin_write_int16<W: Write>(uart: &mut W, addr: u16, value: u16) {
     let _ = uart.write_all(&buf).await;
 }
 
+fn calc_load_resistance(voltage_v: f32, current_v: f32) -> f32 {
+    if current_v <= 0.1 {
+        if voltage_v > 0.1 { 999.9 } else { 0.0 }
+    } else {
+        (voltage_v / current_v).min(999.9)
+    }
+}
+
 async fn dwin_write_int32<W: embedded_io_async::Write>(uart: &mut W, addr: u16, value: u32) {
     let buf = [
         0x5A,
@@ -58,6 +96,24 @@ async fn dwin_write_int32<W: embedded_io_async::Write>(uart: &mut W, addr: u16, 
         (value & 0xFF) as u8,
     ];
     let _ = uart.write_all(&buf).await;
+}
+
+async fn dwin_write_text<W: Write>(uart: &mut W, addr: u16, text: &str, max_len: usize) {
+    let mut buf = [b' '; 38]; // 6 байт заголовка + до 32 байт текста
+    let len = max_len.min(32);
+
+    buf[0] = 0x5A;
+    buf[1] = 0xA5;
+    buf[2] = (3 + len) as u8;
+    buf[3] = 0x82;
+    buf[4] = (addr >> 8) as u8;
+    buf[5] = (addr & 0xFF) as u8;
+
+    let bytes = text.as_bytes();
+    let copy_len = bytes.len().min(len);
+    buf[6..6 + copy_len].copy_from_slice(&bytes[..copy_len]);
+
+    let _ = uart.write_all(&buf[..6 + len]).await;
 }
 
 static mut PENDING_ID: u32 = 0;
@@ -215,6 +271,14 @@ pub async fn dwin_task(
                                                     crate::SAVE_FLASH_REQUEST
                                                         .store(true, Ordering::Relaxed);
                                                 }
+                                                0x504E => {
+                                                    if data == 1 {
+                                                        info!(
+                                                            "-> DWIN: Нажата кнопка GET (замер поляризационного потенциала)"
+                                                        );
+                                                        crate::FORCE_POL_MEASURE.signal(());
+                                                    }
+                                                }
                                                 _ => {}
                                             }
                                         }
@@ -234,6 +298,8 @@ pub async fn dwin_task(
     };
 
     let tx_fut = async {
+        let mut last_cmd_text: &str = "";
+        let mut cmd_show_until = embassy_time::Instant::now();
         loop {
             if crate::POWER_SOURCE.load(Ordering::Relaxed) {
                 Timer::after(Duration::from_secs(1)).await;
@@ -281,6 +347,9 @@ pub async fn dwin_task(
             dwin_write_float(&mut tx, 0x5028, temp_c).await; // Температура
 
             // --- 3. ОТПРАВКА INT16 ЗНАЧЕНИЙ ---
+            let resistance_x10 = (calc_load_resistance(voltage_v, current_v) * 10.0 + 0.5) as u16;
+            dwin_write_int16(&mut tx, 0x504C, resistance_x10).await;
+
             dwin_write_int16(&mut tx, 0x5012, current_pwm).await;
             dwin_write_int16(&mut tx, 0x5016, door_val).await; // Дверь
             dwin_write_int16(&mut tx, 0x5026, csq).await; // Антенна GSM (уровень)
@@ -347,6 +416,59 @@ pub async fn dwin_task(
 
             // Если для Bluetooth есть свой адрес в DGUS (например, 0x5019)
             dwin_write_int16(&mut tx, 0x5019, 1).await;
+
+            // Проверяем, не пришла ли новая команда с сервера
+            let gsm_cmd = crate::LAST_GSM_CMD.swap(0, Ordering::Relaxed);
+            if gsm_cmd != 0 {
+                last_cmd_text = match gsm_cmd {
+                    1 => "SRV: Heartbeat",
+                    3 => "SRV: Set Period",
+                    5 => "SRV: +1V",
+                    6 => "SRV: -1V",
+                    7 => "SRV: +10V",
+                    8 => "SRV: -10V",
+                    9 => "SRV: Auto ON",
+                    10 => "SRV: Auto OFF",
+                    11 => "SRV: Power ON",
+                    12 => "SRV: Power OFF",
+                    13 => "SRV: +0.1V",
+                    14 => "SRV: -0.1V",
+                    15 => "SRV: Update FW",
+                    _ => "SRV: Command",
+                };
+                cmd_show_until = embassy_time::Instant::now() + Duration::from_secs(5);
+            }
+
+            // --- Строка 0x5100 (25 символов): приоритет OTA -> команда сервера -> режим ---
+            let mut auto_buf = StrBuf::<25>::new();
+            let status_line_1 = if crate::OTA_IN_PROGRESS.load(Ordering::Relaxed) {
+                "Programming..."
+            } else if embassy_time::Instant::now() < cmd_show_until {
+                last_cmd_text
+            } else if crate::AUTO_MODE.load(Ordering::Relaxed) {
+                let centivolts = (target_mv + 5) / 10; // Округление до 0.01 В
+                let _ = write!(
+                    auto_buf,
+                    "Auto reg. {}.{:02}V !",
+                    centivolts / 100,
+                    centivolts % 100
+                );
+                auto_buf.as_str()
+            } else {
+                "manual reg U,I"
+            };
+            dwin_write_text(&mut tx, 0x5100, status_line_1, 25).await;
+
+            // --- Строка 0x5119 (20 символов): ограничение тока ---
+            let status_line_2 = if crate::LIMIT_10A_EN.load(Ordering::Relaxed) {
+                "Max 10A"
+            } else {
+                "Max 30A"
+            };
+            dwin_write_text(&mut tx, 0x5119, status_line_2, 20).await;
+
+            // --- Строка 0x5140 (10 символов): версия прошивки ---
+            dwin_write_text(&mut tx, 0x5140, crate::FW_VERSION, 10).await;
         }
     };
 

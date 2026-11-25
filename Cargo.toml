@@ -17,6 +17,7 @@ cortex-m-rt = "0.7"
 defmt = "1.1.1"
 defmt-rtt = "1.3.0"
 panic-probe = { version = "1.0.0", features = ["print-defmt"] }
+panic-reset = "0.1.1"
 
 # Экосистема Embassy (обновленные фичи)
 embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread", "defmt"] }
@@ -61,8 +62,8 @@ embedded-io-async = { version = "0.7.0", default-features = false }
 [profile.release]
 debug = 2         # Оставляет символы для defmt/RTT (НЕ увеличивает размер прошивки во флеше МК!)
 opt-level = "s"   # Оптимизация по размеру (можно "z" для минимального размера)
-#lto = true        # Оптимизация на этапе линковки
-lto = "thin"
+lto = true        # Оптимизация на этапе линковки
+#lto = "thin"
 
 #cargo build --release
 #probe-rs run --chip STM32F412RG target\thumbv7em-none-eabihf\release\station-cpu
